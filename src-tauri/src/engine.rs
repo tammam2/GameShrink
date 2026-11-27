@@ -721,7 +721,7 @@ pub fn run_ultra_play_session(
     let launch_target = if orig_exe.exists() {
         orig_exe
     } else {
-        exe_path
+        exe_path.clone()
     };
 
     let mut child = Command::new(&launch_target)
