@@ -1,11 +1,14 @@
 mod db;
 mod engine;
+mod hypercodec;
 mod models;
 mod scanner;
 mod win_fs;
 
 use db::LedgerDb;
-use models::{CompressRequest, GameDetailResponse, GameRecord, GlobalStats, ScanPreview};
+use models::{
+    BenchmarkReport, CompressRequest, GameDetailResponse, GameRecord, GlobalStats, ScanPreview,
+};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -14,6 +17,14 @@ use tauri::{AppHandle, Manager, State};
 #[tauri::command]
 async fn scan_game_folder(path: String) -> Result<ScanPreview, String> {
     tauri::async_runtime::spawn_blocking(move || scanner::scan_game_preview(&path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn benchmark_beyond_sota(path: String) -> Result<BenchmarkReport, String> {
+    tauri::async_runtime::spawn_blocking(move || scanner::benchmark_beyond_sota(&path))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
@@ -121,6 +132,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             scan_game_folder,
+            benchmark_beyond_sota,
             compress_game,
             restore_game,
             list_games,

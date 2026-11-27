@@ -1,4 +1,8 @@
-export type CompressionMode = "max_crush" | "brute_max" | "adaptive_thermal";
+export type CompressionMode =
+  | "max_crush"
+  | "brute_max"
+  | "adaptive_thermal"
+  | "hyper_archive";
 
 export interface CompressRequest {
   path: string;
@@ -78,6 +82,7 @@ export interface ScanPreview {
   current_disk_bytes: number;
   duplicate_files: number;
   duplicate_reclaimable_bytes: number;
+  chrono_delta_pairs: number;
   compressible_bytes: number;
   high_entropy_bytes: number;
   cold_vault_candidates: number;
@@ -85,6 +90,25 @@ export interface ScanPreview {
   estimated_after_bytes: number;
   estimated_saved_bytes: number;
   categories: CategoryBreakdown[];
+}
+
+export interface BenchmarkSampleRow {
+  rel_path: string;
+  raw_bytes: number;
+  zstd19_bytes: number;
+  hyper_bytes: number;
+  winning_codec: string;
+  extra_gain_pct: number;
+}
+
+export interface BenchmarkReport {
+  sample_count: number;
+  total_raw_bytes: number;
+  total_zstd19_bytes: number;
+  total_hyper_bytes: number;
+  chrono_delta_pairs_found: number;
+  extra_saved_over_zstd_bytes: number;
+  rows: BenchmarkSampleRow[];
 }
 
 export interface GameDetailResponse {

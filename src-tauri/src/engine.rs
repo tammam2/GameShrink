@@ -1,14 +1,14 @@
 use crate::db::LedgerDb;
+use crate::hypercodec;
 use crate::models::{
     CompressRequest, CompressionMode, FileAuditRecord, GameRecord, ProgressEvent,
 };
-use crate::scanner::{
-    self, HIGH_ENTROPY_THRESHOLD, MIN_COMPRESS_BYTES, VAULT_DIR_NAME,
-};
+use crate::scanner::{self, HIGH_ENTROPY_THRESHOLD, MIN_COMPRESS_BYTES, VAULT_DIR_NAME};
 use crate::win_fs::{self, WofAlgo};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
+
+const HYPER_IN_MEMORY_LIMIT: u64 = 64 * 1024 * 1024; // 64 MB per file for RAM-safe HyperCodec
 
 fn emit_progress(
     app: &AppHandle,
@@ -43,30 +45,41 @@ fn emit_progress(
     );
 }
 
-fn vault_file_zstd19(src: &Path, vault_dest: &Path) -> Result<u64> {
-    if let Some(parent) = vault_dest.parent() {
-        fs::create_dir_all(parent)?;
+fn vault_file_hyper(
+    src: &Path,
+    vault_dest: &Path,
+    reference_path: Option<&Path>,
+) -> Result<(u64, String)> {
+    let meta_len = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    if meta_len <= HYPER_IN_MEMORY_LIMIT {
+        let res = hypercodec::encode_hyper_file(src, vault_dest, reference_path, 19)?;
+        fs::remove_file(src)?;
+        Ok((res.compressed_size, res.codec_label))
+    } else {
+        // Large files (>64 MB): stream directly with Zstd-19 to keep RAM usage flat
+        if let Some(parent) = vault_dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let input = BufReader::new(File::open(src)?);
+        let output = BufWriter::new(File::create(vault_dest)?);
+        zstd::stream::copy_encode(input, output, 19)?;
+        let vaulted_size = win_fs::get_disk_size(vault_dest);
+        fs::remove_file(src)?;
+        Ok((vaulted_size, "Zstd19-Stream".to_string()))
     }
-    let input = BufReader::new(File::open(src)?);
-    let output = BufWriter::new(File::create(vault_dest)?);
-    zstd::stream::copy_encode(input, output, 19)?;
-    let vaulted_size = win_fs::get_disk_size(vault_dest);
-    fs::remove_file(src)?;
-    Ok(vaulted_size)
 }
 
-fn restore_vaulted_file(vault_src: &Path, original_dest: &Path) -> Result<u64> {
+fn restore_vaulted_file(
+    vault_src: &Path,
+    original_dest: &Path,
+    reference_path: Option<&Path>,
+) -> Result<u64> {
     if !vault_src.exists() {
         return Err(anyhow!("Vault file missing: {}", vault_src.display()));
     }
-    if let Some(parent) = original_dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let input = BufReader::new(File::open(vault_src)?);
-    let output = BufWriter::new(File::create(original_dest)?);
-    zstd::stream::copy_decode(input, output)?;
+    let sz = hypercodec::decode_hyper_file(vault_src, original_dest, reference_path)?;
     let _ = fs::remove_file(vault_src);
-    Ok(win_fs::get_disk_size(original_dest))
+    Ok(sz)
 }
 
 pub fn run_compression(
@@ -103,7 +116,7 @@ pub fn run_compression(
 
     let before_bytes: u64 = files.iter().map(|f| f.disk_bytes).sum();
 
-    // Pass 1: Find intra-game duplicates strictly inside this single game folder
+    // Pass 1: Intra-game exact duplicate detection
     let duplicates = if req.enable_hardlink_dedup {
         emit_progress(
             app,
@@ -115,102 +128,233 @@ pub fn run_compression(
         );
         scanner::find_intra_game_duplicates(&files)
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
     };
 
+    let vault_root = root.join(VAULT_DIR_NAME);
     let processed = AtomicU64::new(0);
     let saved_running = AtomicU64::new(0);
 
-    // Cold Vault is automatically locked OFF when anti-cheat is detected for safety
-    let allow_cold_vault = req.enable_cold_vault && !anti_cheat_detected;
-    let vault_root = root.join(VAULT_DIR_NAME);
+    // Handle Beyond-SOTA HyperArchive mode (Full Deep Freeze: Dedup + ChronoDelta + CanonPack + Auto-SIMD + Zstd-19)
+    let audits: Vec<FileAuditRecord> = if req.mode == CompressionMode::HyperArchive {
+        emit_progress(
+            app,
+            "ChronoDelta LSH Clustering",
+            "Discovering cross-asset near-duplicates...",
+            0,
+            total_files,
+            0,
+        );
 
-    // Process files in parallel via Rayon (hardlinks first on duplicates, then WOF LZX/XPRESS8K or Vault)
-    let audits: Vec<FileAuditRecord> = files
-        .par_iter()
-        .map(|f| {
-            let mut action = "Unchanged".to_string();
-            let mut after = f.disk_bytes;
-            let mut blake3_hash: Option<String> = None;
-            let mut hardlink_target: Option<String> = None;
-            let mut vault_path: Option<String> = None;
+        let chrono_input: Vec<(String, PathBuf, u64)> = files
+            .iter()
+            .filter(|f| {
+                !duplicates.contains_key(&f.rel_path)
+                    && f.logical_bytes >= MIN_COMPRESS_BYTES
+                    && f.logical_bytes <= HYPER_IN_MEMORY_LIMIT
+            })
+            .map(|f| (f.rel_path.clone(), f.abs_path.clone(), f.logical_bytes))
+            .collect();
+        let chrono_pairs = hypercodec::find_chrono_delta_pairs(&chrono_input);
 
-            if let Some((canonical_rel, hash)) = duplicates.get(&f.rel_path) {
-                let canonical_abs = root.join(canonical_rel);
-                if win_fs::replace_with_hardlink(&f.abs_path, &canonical_abs).is_ok() {
-                    action = "Hardlinked".to_string();
-                    after = 0; // Physical storage reclaimed because inode is shared
-                    blake3_hash = Some(hash.clone());
-                    hardlink_target = Some(canonical_rel.clone());
-                } else {
-                    action = "Skipped-Error".to_string();
+        // Phase A: Encode ChronoDelta P-Assets FIRST (while I-Asset references are still on disk!)
+        let mut phase_a_audits: Vec<FileAuditRecord> = files
+            .par_iter()
+            .filter(|f| chrono_pairs.contains_key(&f.rel_path))
+            .map(|f| {
+                let ref_rel = chrono_pairs.get(&f.rel_path).unwrap();
+                let ref_abs = root.join(ref_rel);
+                let rel_vault = format!("{}.aether", f.rel_path);
+                let dest = vault_root.join(&rel_vault);
+
+                let (after, action, vp, ht) =
+                    match vault_file_hyper(&f.abs_path, &dest, Some(&ref_abs)) {
+                        Ok((sz, label)) => (sz, label, Some(rel_vault), Some(ref_rel.clone())),
+                        Err(_) => (f.disk_bytes, "Skipped-Error".to_string(), None, None),
+                    };
+
+                let saved = f.disk_bytes.saturating_sub(after);
+                let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                let total_saved_now = saved_running.fetch_add(saved, Ordering::Relaxed) + saved;
+                if done == total_files || done % 15 == 0 {
+                    emit_progress(
+                        app,
+                        "ChronoDelta P-Asset Residuals",
+                        &f.rel_path,
+                        done,
+                        total_files,
+                        total_saved_now,
+                    );
                 }
-            } else if allow_cold_vault && f.is_cold_vault_candidate {
-                let rel_zst = format!("{}.zst", f.rel_path);
-                let dest = vault_root.join(&rel_zst);
-                if let Ok(vsize) = vault_file_zstd19(&f.abs_path, &dest) {
-                    action = "Vaulted-Zstd19".to_string();
-                    after = vsize;
-                    vault_path = Some(rel_zst);
-                } else {
-                    action = "Skipped-Error".to_string();
+
+                FileAuditRecord {
+                    id: 0,
+                    game_id: game_id.clone(),
+                    rel_path: f.rel_path.clone(),
+                    category: f.category.clone(),
+                    before_bytes: f.disk_bytes,
+                    after_bytes: after,
+                    saved_bytes: saved,
+                    action,
+                    entropy: (f.entropy * 100.0).round() / 100.0,
+                    blake3_hash: None,
+                    hardlink_target: ht,
+                    vault_path: vp,
                 }
-            } else if f.logical_bytes < MIN_COMPRESS_BYTES {
-                action = "Skipped-TooSmall".to_string();
-            } else if req.mode != CompressionMode::BruteMax && f.entropy > HIGH_ENTROPY_THRESHOLD {
-                action = "Skipped-HighEntropy".to_string();
-            } else {
-                let algo = match req.mode {
-                    CompressionMode::MaxCrush | CompressionMode::BruteMax => WofAlgo::Lzx,
-                    CompressionMode::AdaptiveThermal => {
-                        if f.is_streaming_archive {
-                            WofAlgo::Xpress8k
-                        } else {
-                            WofAlgo::Lzx
+            })
+            .collect();
+
+        // Phase B: Encode remaining I-Assets, exact duplicates, and independent files
+        let phase_b_audits: Vec<FileAuditRecord> = files
+            .par_iter()
+            .filter(|f| !chrono_pairs.contains_key(&f.rel_path))
+            .map(|f| {
+                let (after, action, blake3_hash, hardlink_target, vault_path) =
+                    if let Some((canonical_rel, hash)) = duplicates.get(&f.rel_path) {
+                        // In HyperArchive, exact duplicates are removed and recreated via hardlink on restore
+                        let _ = fs::remove_file(&f.abs_path);
+                        (
+                            0,
+                            "Hardlinked".to_string(),
+                            Some(hash.clone()),
+                            Some(canonical_rel.clone()),
+                            None,
+                        )
+                    } else if f.logical_bytes < MIN_COMPRESS_BYTES {
+                        (f.disk_bytes, "Skipped-TooSmall".to_string(), None, None, None)
+                    } else {
+                        let rel_vault = format!("{}.aether", f.rel_path);
+                        let dest = vault_root.join(&rel_vault);
+                        match vault_file_hyper(&f.abs_path, &dest, None) {
+                            Ok((sz, label)) => (sz, label, None, None, Some(rel_vault)),
+                            Err(_) => (f.disk_bytes, "Skipped-Error".to_string(), None, None, None),
                         }
-                    }
-                };
+                    };
 
-                match win_fs::compress_file_wof(&f.abs_path, algo) {
-                    Ok(new_disk_size) => {
-                        after = new_disk_size.min(f.disk_bytes);
-                        action = algo.label().to_string();
-                    }
-                    Err(_) => {
-                        action = "Skipped-Error".to_string();
-                    }
+                let saved = f.disk_bytes.saturating_sub(after);
+                let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                let total_saved_now = saved_running.fetch_add(saved, Ordering::Relaxed) + saved;
+                if done == total_files || done % 15 == 0 {
+                    emit_progress(
+                        app,
+                        "HyperVault (CanonPack + Auto-SIMD + Zstd-19)",
+                        &f.rel_path,
+                        done,
+                        total_files,
+                        total_saved_now,
+                    );
                 }
-            }
 
-            let saved = f.disk_bytes.saturating_sub(after);
-            let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
-            let total_saved_now = saved_running.fetch_add(saved, Ordering::Relaxed) + saved;
+                FileAuditRecord {
+                    id: 0,
+                    game_id: game_id.clone(),
+                    rel_path: f.rel_path.clone(),
+                    category: f.category.clone(),
+                    before_bytes: f.disk_bytes,
+                    after_bytes: after,
+                    saved_bytes: saved,
+                    action,
+                    entropy: (f.entropy * 100.0).round() / 100.0,
+                    blake3_hash,
+                    hardlink_target,
+                    vault_path,
+                }
+            })
+            .collect();
 
-            if done == total_files || done % 25 == 0 {
-                let phase = match action.as_str() {
-                    "Hardlinked" => "Intra-Game Hardlink Dedup",
-                    "Vaulted-Zstd19" => "Cold Vaulting (Zstd-19)",
-                    _ => "Compressing (NTFS LZX Engine)",
-                };
-                emit_progress(app, phase, &f.rel_path, done, total_files, total_saved_now);
-            }
+        phase_a_audits.extend(phase_b_audits);
+        phase_a_audits
+    } else {
+        // Playable Direct-.exe Modes (MaxCrush LZX / BruteMax / AdaptiveThermal + optional Cold HyperVault)
+        let allow_cold_vault = req.enable_cold_vault && !anti_cheat_detected;
 
-            FileAuditRecord {
-                id: 0,
-                game_id: game_id.clone(),
-                rel_path: f.rel_path.clone(),
-                category: f.category.clone(),
-                before_bytes: f.disk_bytes,
-                after_bytes: after,
-                saved_bytes: saved,
-                action,
-                entropy: (f.entropy * 100.0).round() / 100.0,
-                blake3_hash,
-                hardlink_target,
-                vault_path,
-            }
-        })
-        .collect();
+        files
+            .par_iter()
+            .map(|f| {
+                let (after, action, blake3_hash, hardlink_target, vault_path) =
+                    if let Some((canonical_rel, hash)) = duplicates.get(&f.rel_path) {
+                        let canonical_abs = root.join(canonical_rel);
+                        if win_fs::replace_with_hardlink(&f.abs_path, &canonical_abs).is_ok() {
+                            (
+                                0,
+                                "Hardlinked".to_string(),
+                                Some(hash.clone()),
+                                Some(canonical_rel.clone()),
+                                None,
+                            )
+                        } else {
+                            (f.disk_bytes, "Skipped-Error".to_string(), None, None, None)
+                        }
+                    } else if allow_cold_vault && f.is_cold_vault_candidate {
+                        let rel_vault = format!("{}.aether", f.rel_path);
+                        let dest = vault_root.join(&rel_vault);
+                        match vault_file_hyper(&f.abs_path, &dest, None) {
+                            Ok((vsize, label)) => (vsize, label, None, None, Some(rel_vault)),
+                            Err(_) => (f.disk_bytes, "Skipped-Error".to_string(), None, None, None),
+                        }
+                    } else if f.logical_bytes < MIN_COMPRESS_BYTES {
+                        (f.disk_bytes, "Skipped-TooSmall".to_string(), None, None, None)
+                    } else if req.mode != CompressionMode::BruteMax
+                        && f.entropy > HIGH_ENTROPY_THRESHOLD
+                    {
+                        (f.disk_bytes, "Skipped-HighEntropy".to_string(), None, None, None)
+                    } else {
+                        let algo = match req.mode {
+                            CompressionMode::MaxCrush | CompressionMode::BruteMax => WofAlgo::Lzx,
+                            CompressionMode::AdaptiveThermal => {
+                                if f.is_streaming_archive {
+                                    WofAlgo::Xpress8k
+                                } else {
+                                    WofAlgo::Lzx
+                                }
+                            }
+                            CompressionMode::HyperArchive => WofAlgo::Lzx,
+                        };
+
+                        match win_fs::compress_file_wof(&f.abs_path, algo) {
+                            Ok(new_disk_size) => (
+                                new_disk_size.min(f.disk_bytes),
+                                algo.label().to_string(),
+                                None,
+                                None,
+                                None,
+                            ),
+                            Err(_) => (f.disk_bytes, "Skipped-Error".to_string(), None, None, None),
+                        }
+                    };
+
+                let saved = f.disk_bytes.saturating_sub(after);
+                let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                let total_saved_now = saved_running.fetch_add(saved, Ordering::Relaxed) + saved;
+
+                if done == total_files || done % 25 == 0 {
+                    let phase = match action.as_str() {
+                        "Hardlinked" => "Intra-Game Hardlink Dedup",
+                        a if a.contains("Zstd") || a.contains("CanonPack") || a.contains("AutoSIMD") => {
+                            "HyperVault Cold Assets"
+                        }
+                        _ => "Compressing (NTFS LZX Engine)",
+                    };
+                    emit_progress(app, phase, &f.rel_path, done, total_files, total_saved_now);
+                }
+
+                FileAuditRecord {
+                    id: 0,
+                    game_id: game_id.clone(),
+                    rel_path: f.rel_path.clone(),
+                    category: f.category.clone(),
+                    before_bytes: f.disk_bytes,
+                    after_bytes: after,
+                    saved_bytes: saved,
+                    action,
+                    entropy: (f.entropy * 100.0).round() / 100.0,
+                    blake3_hash,
+                    hardlink_target,
+                    vault_path,
+                }
+            })
+            .collect()
+    };
 
     let mut after_bytes = 0u64;
     let mut dedup_saved_bytes = 0u64;
@@ -223,22 +367,17 @@ pub fn run_compression(
 
     for a in &audits {
         after_bytes += a.after_bytes;
-        match a.action.as_str() {
-            "Hardlinked" => {
-                files_hardlinked += 1;
-                dedup_saved_bytes += a.saved_bytes;
-            }
-            "LZX" | "XPRESS8K" => {
-                files_compressed += 1;
-                lzx_saved_bytes += a.saved_bytes;
-            }
-            "Vaulted-Zstd19" => {
-                files_vaulted += 1;
-                vault_saved_bytes += a.saved_bytes;
-            }
-            _ => {
-                files_skipped += 1;
-            }
+        if a.action == "Hardlinked" {
+            files_hardlinked += 1;
+            dedup_saved_bytes += a.saved_bytes;
+        } else if a.action == "LZX" || a.action == "XPRESS8K" {
+            files_compressed += 1;
+            lzx_saved_bytes += a.saved_bytes;
+        } else if a.vault_path.is_some() {
+            files_vaulted += 1;
+            vault_saved_bytes += a.saved_bytes;
+        } else {
+            files_skipped += 1;
         }
     }
 
@@ -247,6 +386,12 @@ pub fn run_compression(
         (saved_bytes as f64 / before_bytes as f64) * 100.0
     } else {
         0.0
+    };
+
+    let status = if req.mode == CompressionMode::HyperArchive {
+        "archived".to_string()
+    } else {
+        "compressed".to_string()
     };
 
     let record = GameRecord {
@@ -271,11 +416,18 @@ pub fn run_compression(
         files_vaulted,
         duration_secs: start.elapsed().as_secs_f64(),
         last_compressed_at: Utc::now().to_rfc3339(),
-        status: "compressed".to_string(),
+        status,
     };
 
     db.upsert_game(&record, &audits)?;
-    emit_progress(app, "Complete", "Ledger saved to SQLite", total_files, total_files, saved_bytes);
+    emit_progress(
+        app,
+        "Complete",
+        "Ledger saved to SQLite",
+        total_files,
+        total_files,
+        saved_bytes,
+    );
 
     Ok(record)
 }
@@ -295,44 +447,32 @@ pub fn restore_game(
     let total = all_audits.len() as u64;
     let processed = AtomicU64::new(0);
 
-    let updated_audits: Vec<FileAuditRecord> = all_audits
+    // Phase 1: Restore all non-ChronoDelta vaulted files (I-Assets) and WOF files first
+    let phase1_audits: Vec<FileAuditRecord> = all_audits
         .par_iter()
+        .filter(|a| !(a.vault_path.is_some() && a.hardlink_target.is_some()) && a.action != "Hardlinked")
         .map(|a| {
             let abs = root.join(&a.rel_path);
             let mut restored_size = a.before_bytes;
 
-            match a.action.as_str() {
-                "Vaulted-Zstd19" => {
-                    if let Some(vp) = &a.vault_path {
-                        let vault_file = vault_root.join(vp);
-                        if let Ok(sz) = restore_vaulted_file(&vault_file, &abs) {
-                            restored_size = sz;
-                        }
+            if let Some(vp) = &a.vault_path {
+                let vault_file = vault_root.join(vp);
+                if let Ok(sz) = restore_vaulted_file(&vault_file, &abs, None) {
+                    restored_size = sz;
+                }
+            } else if a.action == "LZX" || a.action == "XPRESS8K" {
+                if abs.exists() {
+                    if let Ok(sz) = win_fs::decompress_file_wof(&abs) {
+                        restored_size = sz;
                     }
                 }
-                "Hardlinked" => {
-                    if break_hardlinks && abs.exists() {
-                        let _ = win_fs::break_hardlink(&abs);
-                        restored_size = win_fs::get_disk_size(&abs);
-                    }
-                }
-                "LZX" | "XPRESS8K" => {
-                    if abs.exists() {
-                        if let Ok(sz) = win_fs::decompress_file_wof(&abs) {
-                            restored_size = sz;
-                        }
-                    }
-                }
-                _ => {
-                    if abs.exists() {
-                        restored_size = win_fs::get_disk_size(&abs);
-                    }
-                }
+            } else if abs.exists() {
+                restored_size = win_fs::get_disk_size(&abs);
             }
 
             let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
             if done == total || done % 25 == 0 {
-                emit_progress(app, "Restoring Original Files", &a.rel_path, done, total, 0);
+                emit_progress(app, "Restoring Base & I-Asset Files", &a.rel_path, done, total, 0);
             }
 
             FileAuditRecord {
@@ -352,7 +492,71 @@ pub fn restore_game(
         })
         .collect();
 
-    // Clean empty vault folder if present
+    // Phase 2: Reconstruct ChronoDelta P-Assets (now that their I-Asset references are on disk) + Hardlinks
+    let phase2_audits: Vec<FileAuditRecord> = all_audits
+        .par_iter()
+        .filter(|a| (a.vault_path.is_some() && a.hardlink_target.is_some()) || a.action == "Hardlinked")
+        .map(|a| {
+            let abs = root.join(&a.rel_path);
+            let mut restored_size = a.before_bytes;
+
+            if let (Some(vp), Some(ref_rel)) = (&a.vault_path, &a.hardlink_target) {
+                let vault_file = vault_root.join(vp);
+                let ref_abs = root.join(ref_rel);
+                if let Ok(sz) = restore_vaulted_file(&vault_file, &abs, Some(&ref_abs)) {
+                    restored_size = sz;
+                }
+            } else if a.action == "Hardlinked" {
+                if !abs.exists() {
+                    // Recreate from canonical target if removed during HyperArchive
+                    if let Some(canon_rel) = &a.hardlink_target {
+                        let canon_abs = root.join(canon_rel);
+                        if canon_abs.exists() {
+                            if let Some(parent) = abs.parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            let _ = fs::copy(&canon_abs, &abs);
+                            restored_size = win_fs::get_disk_size(&abs);
+                        }
+                    }
+                } else if break_hardlinks {
+                    let _ = win_fs::break_hardlink(&abs);
+                    restored_size = win_fs::get_disk_size(&abs);
+                }
+            }
+
+            let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if done == total || done % 25 == 0 {
+                emit_progress(
+                    app,
+                    "Reconstructing ChronoDelta & Hardlinks",
+                    &a.rel_path,
+                    done,
+                    total,
+                    0,
+                );
+            }
+
+            FileAuditRecord {
+                id: 0,
+                game_id: a.game_id.clone(),
+                rel_path: a.rel_path.clone(),
+                category: a.category.clone(),
+                before_bytes: restored_size,
+                after_bytes: restored_size,
+                saved_bytes: 0,
+                action: "Restored".to_string(),
+                entropy: a.entropy,
+                blake3_hash: a.blake3_hash.clone(),
+                hardlink_target: None,
+                vault_path: None,
+            }
+        })
+        .collect();
+
+    let mut updated_audits = phase1_audits;
+    updated_audits.extend(phase2_audits);
+
     if vault_root.exists() {
         let _ = fs::remove_dir_all(&vault_root);
     }

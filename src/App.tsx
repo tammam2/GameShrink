@@ -10,6 +10,7 @@ import {
   Database,
   FileSearch,
   Flame,
+  FlaskConical,
   FolderOpen,
   HardDrive,
   Layers,
@@ -19,11 +20,13 @@ import {
   Search,
   ShieldAlert,
   ShieldCheck,
+  Snowflake,
   Sparkles,
   Trash2,
   Zap,
 } from "lucide-react";
 import {
+  BenchmarkReport,
   CompressionMode,
   GameDetailResponse,
   GameRecord,
@@ -48,7 +51,9 @@ export default function App() {
   const [enableHardlinks, setEnableHardlinks] = useState(true);
   const [enableColdVault, setEnableColdVault] = useState(false);
   const [scanPreview, setScanPreview] = useState<ScanPreview | null>(null);
+  const [benchmark, setBenchmark] = useState<BenchmarkReport | null>(null);
   const [isScanning, setIsScanning] = useState(false);
+  const [isBenchRunning, setIsBenchRunning] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [progress, setProgress] = useState<ProgressEvent | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -60,7 +65,7 @@ export default function App() {
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
-    setTimeout(() => setToastMsg(null), 4000);
+    setTimeout(() => setToastMsg(null), 4500);
   };
 
   const refreshLibrary = async () => {
@@ -108,6 +113,7 @@ export default function App() {
     setIsScanning(true);
     setErrorMsg(null);
     setScanPreview(null);
+    setBenchmark(null);
     try {
       const preview = await invoke<ScanPreview>("scan_game_folder", { path: targetPath.trim() });
       setScanPreview(preview);
@@ -119,6 +125,22 @@ export default function App() {
       setErrorMsg(String(e));
     } finally {
       setIsScanning(false);
+    }
+  };
+
+  const handleRunBenchmark = async () => {
+    if (!folderPath.trim()) return;
+    setIsBenchRunning(true);
+    setErrorMsg(null);
+    try {
+      const report = await invoke<BenchmarkReport>("benchmark_beyond_sota", {
+        path: folderPath.trim(),
+      });
+      setBenchmark(report);
+    } catch (e) {
+      setErrorMsg(String(e));
+    } finally {
+      setIsBenchRunning(false);
     }
   };
 
@@ -146,7 +168,9 @@ export default function App() {
       });
       await refreshLibrary();
       await openInspector(record.id);
-      showToast(`Crushed ${record.name} — Reclaimed ${formatBytes(record.saved_bytes)} (${record.ratio_pct.toFixed(1)}%)`);
+      showToast(
+        `Crushed ${record.name} — Reclaimed ${formatBytes(record.saved_bytes)} (${record.ratio_pct.toFixed(1)}%)`
+      );
     } catch (e) {
       setErrorMsg(String(e));
     } finally {
@@ -179,7 +203,7 @@ export default function App() {
       if (selectedDetail?.game.id === game.id) {
         await openInspector(game.id);
       }
-      showToast(`Restored ${game.name} losslessly.`);
+      showToast(`Hydrated & restored ${game.name} bit-for-bit losslessly.`);
     } catch (e) {
       setErrorMsg(String(e));
     } finally {
@@ -226,7 +250,14 @@ export default function App() {
     if (!selectedDetail) return [];
     const q = auditSearch.trim().toLowerCase();
     return selectedDetail.audits.filter((a) => {
-      const matchAction = auditFilter === "ALL" || a.action === auditFilter;
+      const matchAction =
+        auditFilter === "ALL" ||
+        (auditFilter === "HYPER"
+          ? a.action.includes("ChronoDelta") ||
+            a.action.includes("CanonPack") ||
+            a.action.includes("AutoSIMD") ||
+            a.action.includes("Zstd")
+          : a.action === auditFilter);
       const matchQuery =
         !q ||
         a.rel_path.toLowerCase().includes(q) ||
@@ -245,8 +276,8 @@ export default function App() {
             <Flame className="h-5 w-5 text-slate-950" />
           </div>
           <div>
-            <h1 className="text-base font-bold tracking-tight text-white">AetherCrush</h1>
-            <p className="text-[11px] font-medium text-emerald-400">LZX + Hardlink Engine</p>
+            <h1 className="text-base font-bold tracking-tight text-white">AetherCrush v2</h1>
+            <p className="text-[11px] font-medium text-emerald-400">Beyond-SOTA Engine</p>
           </div>
         </div>
 
@@ -272,7 +303,7 @@ export default function App() {
             }`}
           >
             <Zap className="h-4 w-4" />
-            Compress New Game
+            Compress & Lab
           </button>
 
           {selectedDetail && (
@@ -299,18 +330,27 @@ export default function App() {
             {formatBytes(stats?.total_saved_bytes ?? 0)}
           </p>
           <p className="mt-1 text-xs text-slate-400">
-            Across {stats?.total_games ?? 0} optimized game{(stats?.total_games ?? 0) === 1 ? "" : "s"}
+            Across {stats?.total_games ?? 0} game{(stats?.total_games ?? 0) === 1 ? "" : "s"}
           </p>
-          <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-400">
-            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-            <span>Direct .exe launch intact</span>
+          <div className="mt-3 space-y-1 text-[11px] text-slate-400">
+            <div className="flex justify-between">
+              <span>NTFS LZX:</span>
+              <span className="text-slate-200">{formatBytes(stats?.total_lzx_saved_bytes ?? 0)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Hardlinks:</span>
+              <span className="text-amber-300">{formatBytes(stats?.total_dedup_saved_bytes ?? 0)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>HyperVault:</span>
+              <span className="text-cyan-300">{formatBytes(stats?.total_vault_saved_bytes ?? 0)}</span>
+            </div>
           </div>
         </div>
       </aside>
 
       {/* Main Content */}
       <main className="relative flex-1 overflow-y-auto p-8">
-        {/* Toast & Error Banners */}
         {toastMsg && (
           <div className="mb-5 flex items-center gap-2.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
             <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
@@ -326,7 +366,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Live Progress Overlay */}
         {isRunning && progress && (
           <div className="mb-6 rounded-2xl border border-emerald-500/30 bg-[#0c1322] p-5 shadow-xl shadow-emerald-950/30">
             <div className="flex items-center justify-between">
@@ -364,7 +403,7 @@ export default function App() {
               <div>
                 <h2 className="text-2xl font-bold text-white">Game Storage Telemetry</h2>
                 <p className="mt-1 text-sm text-slate-400">
-                  Native NTFS LZX + Intra-Game Hardlink Deduplication. Every game runs directly from its .exe.
+                  Playable NTFS LZX + Intra-Game Hardlinks + Beyond-SOTA HyperVault (ChronoDelta, CanonPack & Auto-SIMD).
                 </p>
               </div>
               <button
@@ -376,7 +415,6 @@ export default function App() {
               </button>
             </div>
 
-            {/* KPI Cards */}
             <div className="grid grid-cols-4 gap-4">
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
                 <p className="text-xs text-slate-400">Total Saved</p>
@@ -393,15 +431,15 @@ export default function App() {
                 <p className="mt-1.5 text-2xl font-bold text-cyan-400">
                   {(stats?.avg_ratio_pct ?? 0).toFixed(1)}%
                 </p>
-                <p className="mt-1 text-[11px] text-slate-500">Physical NTFS bytes reclaimed</p>
+                <p className="mt-1 text-[11px] text-slate-500">Physical bytes reclaimed</p>
               </div>
 
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
-                <p className="text-xs text-slate-400">LZX Kernel Savings</p>
-                <p className="mt-1.5 text-2xl font-bold text-white">
-                  {formatBytes(stats?.total_lzx_saved_bytes ?? 0)}
+                <p className="text-xs text-slate-400">HyperVault Savings</p>
+                <p className="mt-1.5 text-2xl font-bold text-indigo-300">
+                  {formatBytes(stats?.total_vault_saved_bytes ?? 0)}
                 </p>
-                <p className="mt-1 text-[11px] text-slate-500">Strongest native WOF codec</p>
+                <p className="mt-1 text-[11px] text-slate-500">ChronoDelta + CanonPack + Auto-SIMD</p>
               </div>
 
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
@@ -415,25 +453,25 @@ export default function App() {
               </div>
             </div>
 
-            {/* Game Cards */}
             {games.length === 0 ? (
               <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-800 bg-[#0b101b]/50 py-16 text-center">
                 <HardDrive className="mb-3 h-10 w-10 text-slate-600" />
                 <h3 className="text-base font-semibold text-slate-200">No games in your ledger yet</h3>
                 <p className="mt-1 max-w-md text-sm text-slate-400">
-                  Select any installed game folder to run an X-Ray entropy & duplicate scan, then crush it with LZX + intra-game hardlinks.
+                  Scan any game folder to benchmark Beyond-SOTA codecs live, or crush it immediately with LZX + Hardlinks or HyperArchive.
                 </p>
                 <button
                   onClick={() => setTab("compress")}
                   className="mt-5 rounded-xl bg-emerald-500/15 px-4 py-2 text-sm font-medium text-emerald-300 ring-1 ring-emerald-500/30 hover:bg-emerald-500/25"
                 >
-                  Open X-Ray Scanner
+                  Open X-Ray Scanner & Codec Lab
                 </button>
               </div>
             ) : (
               <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
                 {games.map((g) => {
                   const keepPct = g.before_bytes > 0 ? (g.after_bytes / g.before_bytes) * 100 : 100;
+                  const isArchived = g.status === "archived";
                   return (
                     <div
                       key={g.id}
@@ -441,9 +479,15 @@ export default function App() {
                     >
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
                             <h3 className="truncate text-base font-bold text-white">{g.name}</h3>
-                            <span className="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+                            <span
+                              className={`rounded-md px-2 py-0.5 text-[10px] font-semibold ${
+                                isArchived
+                                  ? "bg-indigo-500/20 text-indigo-300"
+                                  : "bg-emerald-500/15 text-emerald-300"
+                              }`}
+                            >
                               {formatModeLabel(g.mode)}
                             </span>
                             {g.anti_cheat_detected && (
@@ -468,7 +512,6 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Before / After visual bar */}
                       <div className="mt-4">
                         <div className="mb-1.5 flex justify-between text-xs">
                           <span className="text-slate-400">
@@ -480,35 +523,48 @@ export default function App() {
                         </div>
                         <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
                           <div
-                            className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-emerald-400"
+                            className={`h-full rounded-full ${
+                              isArchived
+                                ? "bg-gradient-to-r from-indigo-500 to-cyan-400"
+                                : "bg-gradient-to-r from-cyan-500 to-emerald-400"
+                            }`}
                             style={{ width: `${Math.min(100, Math.max(4, keepPct))}%` }}
                           />
                         </div>
                       </div>
 
-                      {/* Mini stats */}
                       <div className="mt-3 flex flex-wrap gap-3 text-[11px] text-slate-400">
-                        <span>LZX: {formatBytes(g.lzx_saved_bytes)}</span>
-                        <span>•</span>
-                        <span>Hardlinks: {g.files_hardlinked} ({formatBytes(g.dedup_saved_bytes)})</span>
+                        {g.lzx_saved_bytes > 0 && <span>LZX: {formatBytes(g.lzx_saved_bytes)}</span>}
+                        {g.files_hardlinked > 0 && (
+                          <span>Hardlinks: {g.files_hardlinked} ({formatBytes(g.dedup_saved_bytes)})</span>
+                        )}
                         {g.files_vaulted > 0 && (
-                          <>
-                            <span>•</span>
-                            <span>Vault: {g.files_vaulted} ({formatBytes(g.vault_saved_bytes)})</span>
-                          </>
+                          <span className="text-indigo-300">
+                            HyperVault: {g.files_vaulted} ({formatBytes(g.vault_saved_bytes)})
+                          </span>
                         )}
                       </div>
 
-                      {/* Actions */}
                       <div className="mt-4 flex items-center gap-2 border-t border-slate-800/80 pt-3.5">
-                        {g.exe_path && (
+                        {isArchived ? (
                           <button
-                            onClick={() => handleLaunchExe(g.exe_path)}
-                            className="flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/25"
+                            onClick={() => handleRestore(g)}
+                            disabled={isRunning}
+                            className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 px-3 py-1.5 text-xs font-semibold text-indigo-200 hover:bg-indigo-500/30 disabled:opacity-40"
                           >
-                            <Play className="h-3.5 w-3.5" />
-                            Play .exe
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            Hydrate to Play
                           </button>
+                        ) : (
+                          g.exe_path && (
+                            <button
+                              onClick={() => handleLaunchExe(g.exe_path)}
+                              className="flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/25"
+                            >
+                              <Play className="h-3.5 w-3.5" />
+                              Play .exe
+                            </button>
+                          )
                         )}
                         <button
                           onClick={() => openInspector(g.id)}
@@ -524,18 +580,19 @@ export default function App() {
                         >
                           <FolderOpen className="h-3.5 w-3.5" />
                         </button>
-                        <button
-                          onClick={() => handleRestore(g)}
-                          disabled={isRunning}
-                          className="ml-auto flex items-center gap-1 rounded-lg bg-slate-800/70 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-amber-500/20 hover:text-amber-200 disabled:opacity-40"
-                          title="Decompress & restore original files"
-                        >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                          Restore
-                        </button>
+                        {!isArchived && (
+                          <button
+                            onClick={() => handleRestore(g)}
+                            disabled={isRunning}
+                            className="ml-auto flex items-center gap-1 rounded-lg bg-slate-800/70 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-amber-500/20 hover:text-amber-200 disabled:opacity-40"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            Restore
+                          </button>
+                        )}
                         <button
                           onClick={() => handleDeleteRecord(g.id)}
-                          className="rounded-lg p-1.5 text-slate-500 hover:bg-rose-500/15 hover:text-rose-300"
+                          className={`${isArchived ? "ml-auto" : ""} rounded-lg p-1.5 text-slate-500 hover:bg-rose-500/15 hover:text-rose-300`}
                           title="Remove from ledger"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
@@ -549,17 +606,16 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: COMPRESS NEW GAME (X-RAY SCANNER) */}
+        {/* TAB 2: COMPRESS & BEYOND-SOTA CODEC LAB */}
         {tab === "compress" && (
-          <div className="mx-auto max-w-4xl space-y-6">
+          <div className="mx-auto max-w-5xl space-y-6">
             <div>
-              <h2 className="text-2xl font-bold text-white">X-Ray Scanner & Max Crush Engine</h2>
+              <h2 className="text-2xl font-bold text-white">X-Ray Scanner & Beyond-SOTA Engine</h2>
               <p className="mt-1 text-sm text-slate-400">
-                Inspect Shannon entropy, intra-game duplicates, and anti-cheat status before compressing.
+                Scan Shannon entropy, exact duplicates, and ChronoDelta near-duplicate clusters—or run a live non-destructive codec benchmark.
               </p>
             </div>
 
-            {/* Folder Selector */}
             <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-5">
               <label className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                 Game Installation Folder
@@ -590,9 +646,9 @@ export default function App() {
               </div>
             </div>
 
-            {/* Pre-Flight X-Ray Results */}
             {scanPreview && (
               <div className="space-y-5">
+                {/* X-Ray Summary */}
                 <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-5">
                   <div className="flex flex-wrap items-center justify-between gap-4">
                     <div>
@@ -610,23 +666,31 @@ export default function App() {
                       </p>
                     </div>
 
-                    {scanPreview.anti_cheat_detected ? (
-                      <div className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2 text-xs text-amber-200">
-                        <ShieldAlert className="h-4 w-4 text-amber-400" />
-                        <span>
-                          <strong>{scanPreview.anti_cheat_name}</strong> detected — Hash-safe LZX + Hardlinks only
-                        </span>
-                      </div>
-                    ) : (
-                      <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs text-emerald-200">
-                        <ShieldCheck className="h-4 w-4 text-emerald-400" />
-                        <span>No kernel anti-cheat detected — All modes unlocked</span>
-                      </div>
-                    )}
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        onClick={handleRunBenchmark}
+                        disabled={isBenchRunning}
+                        className="flex items-center gap-2 rounded-xl bg-indigo-500/15 px-3.5 py-2 text-xs font-semibold text-indigo-300 ring-1 ring-indigo-500/30 hover:bg-indigo-500/25 disabled:opacity-40"
+                      >
+                        <FlaskConical className="h-4 w-4" />
+                        {isBenchRunning ? "Benchmarking..." : "Run Beyond-SOTA Benchmark"}
+                      </button>
+
+                      {scanPreview.anti_cheat_detected ? (
+                        <div className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                          <ShieldAlert className="h-4 w-4 text-amber-400" />
+                          <span>{scanPreview.anti_cheat_name}</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
+                          <ShieldCheck className="h-4 w-4 text-emerald-400" />
+                          <span>No Anti-Cheat</span>
+                        </div>
+                      )}
+                    </div>
                   </div>
 
-                  {/* Prediction Metrics */}
-                  <div className="mt-5 grid grid-cols-4 gap-3">
+                  <div className="mt-5 grid grid-cols-5 gap-3">
                     <div className="rounded-xl bg-[#060911] p-3.5">
                       <p className="text-[11px] text-slate-400">Current Disk Size</p>
                       <p className="mt-1 text-lg font-bold text-white">
@@ -634,19 +698,25 @@ export default function App() {
                       </p>
                     </div>
                     <div className="rounded-xl bg-[#060911] p-3.5">
-                      <p className="text-[11px] text-slate-400">Est. Reclaimable</p>
+                      <p className="text-[11px] text-slate-400">Est. LZX Savings</p>
                       <p className="mt-1 text-lg font-bold text-emerald-400">
                         {formatBytes(scanPreview.estimated_saved_bytes)}
                       </p>
                     </div>
                     <div className="rounded-xl bg-[#060911] p-3.5">
-                      <p className="text-[11px] text-slate-400">Intra-Game Duplicates</p>
+                      <p className="text-[11px] text-slate-400">Exact Duplicates</p>
                       <p className="mt-1 text-lg font-bold text-amber-300">
                         {scanPreview.duplicate_files} ({formatBytes(scanPreview.duplicate_reclaimable_bytes)})
                       </p>
                     </div>
                     <div className="rounded-xl bg-[#060911] p-3.5">
-                      <p className="text-[11px] text-slate-400">Already Compressed</p>
+                      <p className="text-[11px] text-slate-400">ChronoDelta Pairs</p>
+                      <p className="mt-1 text-lg font-bold text-indigo-300">
+                        {scanPreview.chrono_delta_pairs} near-dupes
+                      </p>
+                    </div>
+                    <div className="rounded-xl bg-[#060911] p-3.5">
+                      <p className="text-[11px] text-slate-400">High-Entropy (Oodle)</p>
                       <p className="mt-1 text-lg font-bold text-slate-300">
                         {formatBytes(scanPreview.high_entropy_bytes)}
                       </p>
@@ -654,10 +724,68 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Mode Selector */}
+                {/* Live Beyond-SOTA Benchmark Results */}
+                {benchmark && (
+                  <div className="rounded-2xl border border-indigo-500/30 bg-[#0b1122] p-5">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <FlaskConical className="h-4 w-4 text-indigo-400" />
+                        <h3 className="text-sm font-bold text-white">
+                          Live Beyond-SOTA Codec Lab ({benchmark.sample_count} real sample files)
+                        </h3>
+                      </div>
+                      <span className="rounded-lg bg-emerald-500/15 px-2.5 py-1 text-xs font-semibold text-emerald-300">
+                        Extra saved beyond Zstd-19: {formatBytes(benchmark.extra_saved_over_zstd_bytes)}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-slate-400">
+                      Sample Raw: {formatBytes(benchmark.total_raw_bytes)} → Zstd-19:{" "}
+                      {formatBytes(benchmark.total_zstd19_bytes)} →{" "}
+                      <strong className="text-indigo-300">
+                        HyperCodec (ChronoDelta + CanonPack + Auto-SIMD): {formatBytes(benchmark.total_hyper_bytes)}
+                      </strong>
+                    </p>
+                    <div className="mt-3 max-h-52 overflow-y-auto rounded-xl border border-slate-800">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-[#080d1a] text-[10px] uppercase text-slate-400">
+                          <tr>
+                            <th className="px-3 py-2">Sample File</th>
+                            <th className="px-3 py-2">Winning Pipeline</th>
+                            <th className="px-3 py-2 text-right">Raw</th>
+                            <th className="px-3 py-2 text-right">Zstd-19</th>
+                            <th className="px-3 py-2 text-right">HyperCodec</th>
+                            <th className="px-3 py-2 text-right">Beat Zstd-19</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60">
+                          {benchmark.rows.map((r) => (
+                            <tr key={r.rel_path}>
+                              <td className="max-w-[200px] truncate px-3 py-1.5 font-mono text-[11px] text-slate-200">
+                                {r.rel_path}
+                              </td>
+                              <td className="px-3 py-1.5 text-[11px] font-semibold text-indigo-300">
+                                {r.winning_codec}
+                              </td>
+                              <td className="px-3 py-1.5 text-right text-slate-400">{formatBytes(r.raw_bytes)}</td>
+                              <td className="px-3 py-1.5 text-right text-slate-300">{formatBytes(r.zstd19_bytes)}</td>
+                              <td className="px-3 py-1.5 text-right font-semibold text-emerald-400">
+                                {formatBytes(r.hyper_bytes)}
+                              </td>
+                              <td className="px-3 py-1.5 text-right text-cyan-300">
+                                {r.extra_gain_pct > 0 ? `+${r.extra_gain_pct.toFixed(1)}%` : "0.0%"}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* 4-Mode Compression Selector */}
                 <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-5">
                   <h3 className="text-sm font-semibold text-white">Compression Engine Profile</h3>
-                  <div className="mt-3 grid grid-cols-3 gap-3">
+                  <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
                     <button
                       onClick={() => setMode("max_crush")}
                       className={`rounded-xl border p-4 text-left transition ${
@@ -667,11 +795,14 @@ export default function App() {
                       }`}
                     >
                       <div className="flex items-center justify-between">
-                        <span className="text-sm font-bold text-white">Max Crush (Strongest)</span>
+                        <span className="text-xs font-bold text-white">Max Crush (LZX)</span>
                         <Flame className="h-4 w-4 text-emerald-400" />
                       </div>
-                      <p className="mt-1.5 text-xs text-slate-400">
-                        Strongest native NTFS <strong>LZX</strong> codec + Shannon entropy guard so already-Oodle files don&apos;t waste CPU.
+                      <span className="mt-1 inline-block rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
+                        Direct .exe Play
+                      </span>
+                      <p className="mt-1.5 text-[11px] text-slate-400">
+                        Strongest native NTFS <strong>LZX</strong> + Shannon entropy guard. Zero launcher needed.
                       </p>
                     </button>
 
@@ -684,11 +815,14 @@ export default function App() {
                       }`}
                     >
                       <div className="flex items-center justify-between">
-                        <span className="text-sm font-bold text-white">Brute Max (Force LZX)</span>
+                        <span className="text-xs font-bold text-white">Brute Max (All LZX)</span>
                         <Sparkles className="h-4 w-4 text-cyan-400" />
                       </div>
-                      <p className="mt-1.5 text-xs text-slate-400">
-                        Forces <strong>LZX</strong> on every single file regardless of entropy to squeeze out every last megabyte.
+                      <span className="mt-1 inline-block rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">
+                        Direct .exe Play
+                      </span>
+                      <p className="mt-1.5 text-[11px] text-slate-400">
+                        Forces <strong>LZX</strong> on every single file regardless of entropy to squeeze every MB.
                       </p>
                     </button>
 
@@ -701,11 +835,34 @@ export default function App() {
                       }`}
                     >
                       <div className="flex items-center justify-between">
-                        <span className="text-sm font-bold text-white">Adaptive Thermal</span>
+                        <span className="text-xs font-bold text-white">Adaptive Thermal</span>
                         <Cpu className="h-4 w-4 text-purple-400" />
                       </div>
-                      <p className="mt-1.5 text-xs text-slate-400">
-                        <strong>LZX</strong> on static/startup files + <strong>XPRESS8K</strong> on open-world streaming archives.
+                      <span className="mt-1 inline-block rounded bg-purple-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-purple-300">
+                        Direct .exe Play
+                      </span>
+                      <p className="mt-1.5 text-[11px] text-slate-400">
+                        <strong>LZX</strong> on static/startup files + <strong>XPRESS8K</strong> on open-world streams.
+                      </p>
+                    </button>
+
+                    <button
+                      onClick={() => setMode("hyper_archive")}
+                      className={`rounded-xl border p-4 text-left transition ${
+                        mode === "hyper_archive"
+                          ? "border-indigo-400 bg-indigo-500/15"
+                          : "border-slate-800 bg-[#060911] hover:border-slate-700"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-white">HyperArchive</span>
+                        <Snowflake className="h-4 w-4 text-indigo-300" />
+                      </div>
+                      <span className="mt-1 inline-block rounded bg-indigo-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-300">
+                        Beyond-SOTA Max
+                      </span>
+                      <p className="mt-1.5 text-[11px] text-slate-400">
+                        Stacks <strong>ChronoDelta + CanonPack + Auto-SIMD + Zstd-19</strong>. 1-click Hydrate to play.
                       </p>
                     </button>
                   </div>
@@ -720,7 +877,7 @@ export default function App() {
                             Intra-Game Hardlink Deduplication (Single-Game Scope)
                           </p>
                           <p className="text-xs text-slate-400">
-                            Collapses exact duplicate static files inside this game into 1 physical copy (0% FPS cost, safe on uninstall).
+                            Collapses exact duplicate static files inside this game into 1 physical copy (0% FPS cost).
                           </p>
                         </div>
                       </div>
@@ -732,42 +889,48 @@ export default function App() {
                       />
                     </label>
 
-                    <label
-                      className={`flex items-center justify-between rounded-xl bg-[#060911] px-4 py-3 ${
-                        scanPreview.anti_cheat_detected ? "opacity-50" : "cursor-pointer"
-                      }`}
-                    >
-                      <div className="flex items-center gap-3">
-                        <Archive className="h-4 w-4 text-cyan-400" />
-                        <div>
-                          <p className="text-sm font-medium text-white">
-                            Zstd-19 Cold Vault for Unused Foreign Voice Packs ({scanPreview.cold_vault_candidates} found •{" "}
-                            {formatBytes(scanPreview.cold_vault_bytes)})
-                          </p>
-                          <p className="text-xs text-slate-400">
-                            {scanPreview.anti_cheat_detected
-                              ? "Locked OFF because kernel anti-cheat was detected."
-                              : "Archives detected non-English voice packs at Zstd level 19 with 1-click lossless restore."}
-                          </p>
+                    {mode !== "hyper_archive" && (
+                      <label
+                        className={`flex items-center justify-between rounded-xl bg-[#060911] px-4 py-3 ${
+                          scanPreview.anti_cheat_detected ? "opacity-50" : "cursor-pointer"
+                        }`}
+                      >
+                        <div className="flex items-center gap-3">
+                          <Archive className="h-4 w-4 text-cyan-400" />
+                          <div>
+                            <p className="text-sm font-medium text-white">
+                              HyperVault Cold Foreign Voice Packs ({scanPreview.cold_vault_candidates} found •{" "}
+                              {formatBytes(scanPreview.cold_vault_bytes)})
+                            </p>
+                            <p className="text-xs text-slate-400">
+                              {scanPreview.anti_cheat_detected
+                                ? "Locked OFF because kernel anti-cheat was detected."
+                                : "Crushes unused foreign voice packs with Auto-SIMD + Zstd-19 while keeping the game directly playable."}
+                            </p>
+                          </div>
                         </div>
-                      </div>
-                      <input
-                        type="checkbox"
-                        disabled={scanPreview.anti_cheat_detected}
-                        checked={enableColdVault}
-                        onChange={(e) => setEnableColdVault(e.target.checked)}
-                        className="h-4 w-4 accent-cyan-500"
-                      />
-                    </label>
+                        <input
+                          type="checkbox"
+                          disabled={scanPreview.anti_cheat_detected}
+                          checked={enableColdVault}
+                          onChange={(e) => setEnableColdVault(e.target.checked)}
+                          className="h-4 w-4 accent-cyan-500"
+                        />
+                      </label>
+                    )}
                   </div>
 
                   <button
                     onClick={handleCompress}
                     disabled={isRunning}
-                    className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-emerald-500/20 transition hover:brightness-110 disabled:opacity-50"
+                    className={`mt-5 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-sm font-bold text-slate-950 shadow-lg transition hover:brightness-110 disabled:opacity-50 ${
+                      mode === "hyper_archive"
+                        ? "bg-gradient-to-r from-indigo-400 to-cyan-400 shadow-indigo-500/20"
+                        : "bg-gradient-to-r from-emerald-500 to-cyan-500 shadow-emerald-500/20"
+                    }`}
                   >
-                    <Flame className="h-4 w-4" />
-                    {isRunning ? "Compressing..." : `Start ${formatModeLabel(mode)} & Save Ledger`}
+                    {mode === "hyper_archive" ? <Snowflake className="h-4 w-4" /> : <Flame className="h-4 w-4" />}
+                    {isRunning ? "Running Engine..." : `Start ${formatModeLabel(mode)} & Save Ledger`}
                   </button>
                 </div>
               </div>
@@ -793,7 +956,7 @@ export default function App() {
               </div>
 
               <div className="flex items-center gap-2.5">
-                {selectedDetail.game.exe_path && (
+                {selectedDetail.game.status !== "archived" && selectedDetail.game.exe_path && (
                   <button
                     onClick={() => handleLaunchExe(selectedDetail.game.exe_path)}
                     className="flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
@@ -805,15 +968,14 @@ export default function App() {
                 <button
                   onClick={() => handleRestore(selectedDetail.game)}
                   disabled={isRunning}
-                  className="flex items-center gap-2 rounded-xl bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-amber-500/20 hover:text-amber-200 disabled:opacity-40"
+                  className="flex items-center gap-2 rounded-xl bg-indigo-500/20 px-4 py-2 text-sm font-semibold text-indigo-200 hover:bg-indigo-500/30 disabled:opacity-40"
                 >
                   <RotateCcw className="h-4 w-4" />
-                  1-Click Restore
+                  {selectedDetail.game.status === "archived" ? "Hydrate Game to Play" : "1-Click Restore"}
                 </button>
               </div>
             </div>
 
-            {/* Before vs After Summary */}
             <div className="grid grid-cols-5 gap-4">
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
                 <p className="text-xs text-slate-400">Before</p>
@@ -834,12 +996,15 @@ export default function App() {
                 </p>
               </div>
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
-                <p className="text-xs text-slate-400">LZX vs Hardlinks</p>
-                <p className="mt-1 text-sm font-semibold text-white">
+                <p className="text-xs text-slate-400">Method Split</p>
+                <p className="mt-1 text-xs font-semibold text-white">
                   LZX: {formatBytes(selectedDetail.game.lzx_saved_bytes)}
                 </p>
                 <p className="text-xs text-amber-300">
                   Dedup: {formatBytes(selectedDetail.game.dedup_saved_bytes)}
+                </p>
+                <p className="text-xs text-indigo-300">
+                  HyperVault: {formatBytes(selectedDetail.game.vault_saved_bytes)}
                 </p>
               </div>
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
@@ -853,7 +1018,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Category Breakdown */}
             <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-5">
               <div className="mb-3 flex items-center gap-2">
                 <Layers className="h-4 w-4 text-cyan-400" />
@@ -883,7 +1047,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Per-File Audit Table */}
             <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-5">
               <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                 <h3 className="text-sm font-semibold text-white">
@@ -896,11 +1059,11 @@ export default function App() {
                       type="text"
                       value={auditSearch}
                       onChange={(e) => setAuditSearch(e.target.value)}
-                      placeholder="Filter files..."
+                      placeholder="Filter files or codecs..."
                       className="rounded-lg border border-slate-700/80 bg-[#060911] py-1.5 pl-8 pr-3 text-xs text-slate-200 focus:border-emerald-500 focus:outline-none"
                     />
                   </div>
-                  {["ALL", "LZX", "Hardlinked", "Vaulted-Zstd19", "Skipped-HighEntropy"].map((f) => (
+                  {["ALL", "LZX", "Hardlinked", "HYPER", "Skipped-HighEntropy"].map((f) => (
                     <button
                       key={f}
                       onClick={() => setAuditFilter(f)}
@@ -910,7 +1073,7 @@ export default function App() {
                           : "bg-slate-800/70 text-slate-400 hover:text-slate-200"
                       }`}
                     >
-                      {f === "Skipped-HighEntropy" ? "Skipped" : f}
+                      {f === "Skipped-HighEntropy" ? "Skipped" : f === "HYPER" ? "Beyond-SOTA" : f}
                     </button>
                   ))}
                 </div>
@@ -921,20 +1084,25 @@ export default function App() {
                   <thead className="sticky top-0 bg-[#0d1424] text-[11px] uppercase text-slate-400">
                     <tr>
                       <th className="px-3.5 py-2.5">File Path</th>
-                      <th className="px-3 py-2.5">Action</th>
-                      <th className="px-3 py-2.5 text-right">Before</th>
-                      <th className="px-3 py-2.5 text-right">After</th>
-                      <th className="px-3 py-2.5 text-right">Saved</th>
-                      <th className="px-3 py-2.5 text-right">Entropy</th>
+                      <th className="px-3.5 py-2.5">Codec / Action</th>
+                      <th className="px-3.5 py-2.5 text-right">Before</th>
+                      <th className="px-3.5 py-2.5 text-right">After</th>
+                      <th className="px-3.5 py-2.5 text-right">Saved</th>
+                      <th className="px-3.5 py-2.5 text-right">Entropy</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60">
                     {filteredAudits.slice(0, 300).map((a) => (
                       <tr key={a.id} className="hover:bg-slate-800/30">
-                        <td className="max-w-xs truncate px-3.5 py-2 font-mono text-[11px] text-slate-200" title={a.rel_path}>
+                        <td
+                          className="max-w-xs truncate px-3.5 py-2 font-mono text-[11px] text-slate-200"
+                          title={a.rel_path}
+                        >
                           {a.rel_path}
                           {a.hardlink_target && (
-                            <span className="ml-2 text-[10px] text-amber-400">→ {a.hardlink_target}</span>
+                            <span className="ml-2 text-[10px] text-amber-400">
+                              → {a.hardlink_target}
+                            </span>
                           )}
                         </td>
                         <td className="px-3 py-2">
@@ -944,9 +1112,11 @@ export default function App() {
                                 ? "bg-emerald-500/15 text-emerald-300"
                                 : a.action === "Hardlinked"
                                   ? "bg-amber-500/15 text-amber-300"
-                                  : a.action === "Vaulted-Zstd19"
-                                    ? "bg-cyan-500/15 text-cyan-300"
-                                    : "bg-slate-800 text-slate-400"
+                                  : a.action.includes("ChronoDelta")
+                                    ? "bg-indigo-500/20 text-indigo-300"
+                                    : a.action.includes("CanonPack") || a.action.includes("AutoSIMD")
+                                      ? "bg-cyan-500/15 text-cyan-300"
+                                      : "bg-slate-800 text-slate-400"
                             }`}
                           >
                             {a.action}

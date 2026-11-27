@@ -1,16 +1,17 @@
-use crate::models::{CategoryBreakdown, ScanPreview};
+use crate::hypercodec;
+use crate::models::{BenchmarkReport, BenchmarkSampleRow, CategoryBreakdown, ScanPreview};
 use crate::win_fs;
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub const VAULT_DIR_NAME: &str = ".aethercrush_vault";
 pub const HIGH_ENTROPY_THRESHOLD: f64 = 7.82;
-pub const MIN_COMPRESS_BYTES: u64 = 8 * 1024; // Skip tiny <8KB files (NTFS cluster floor)
+pub const MIN_COMPRESS_BYTES: u64 = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ScannedFile {
@@ -138,7 +139,6 @@ pub fn is_streaming_archive(rel_path: &str) -> bool {
     )
 }
 
-/// Identifies non-English foreign voice/localization packs eligible for optional single-player Zstd-19 Cold Vaulting.
 pub fn is_cold_vault_candidate(rel_path: &str, size: u64) -> bool {
     if size < 5 * 1024 * 1024 {
         return false;
@@ -217,7 +217,6 @@ pub fn detect_main_exe(root: &Path, files: &[ScannedFile]) -> Option<String> {
         })
         .collect();
 
-    // Prefer shallow depth, then largest executable size
     candidates.sort_by(|a, b| {
         let depth_a = a.rel_path.matches('/').count() + a.rel_path.matches('\\').count();
         let depth_b = b.rel_path.matches('/').count() + b.rel_path.matches('\\').count();
@@ -283,8 +282,6 @@ pub fn collect_game_files(root: &Path) -> Result<Vec<ScannedFile>> {
     Ok(scanned)
 }
 
-/// Finds exact byte-identical static files strictly INSIDE this single game folder.
-/// Returns a map of `duplicate_rel_path -> (canonical_rel_path, blake3_hash)`.
 pub fn find_intra_game_duplicates(files: &[ScannedFile]) -> HashMap<String, (String, String)> {
     let mut by_size: HashMap<u64, Vec<&ScannedFile>> = HashMap::new();
     for f in files {
@@ -327,6 +324,19 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
     let detected_exe = detect_main_exe(&root, &files);
     let duplicates = find_intra_game_duplicates(&files);
 
+    // Quick ChronoDelta near-duplicate estimation on non-duplicate assets <= 64 MB
+    let chrono_candidates: Vec<(String, PathBuf, u64)> = files
+        .iter()
+        .filter(|f| {
+            !duplicates.contains_key(&f.rel_path)
+                && f.logical_bytes >= 32 * 1024
+                && f.logical_bytes <= 64 * 1024 * 1024
+        })
+        .take(1500)
+        .map(|f| (f.rel_path.clone(), f.abs_path.clone(), f.logical_bytes))
+        .collect();
+    let chrono_pairs = hypercodec::find_chrono_delta_pairs(&chrono_candidates);
+
     let suggested_name = root
         .file_name()
         .and_then(|n| n.to_str())
@@ -359,7 +369,6 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
             est_file_saved = 0;
         } else if f.logical_bytes >= MIN_COMPRESS_BYTES {
             compressible_bytes += f.disk_bytes;
-            // Conservative LZX gain estimate based on Shannon entropy
             let est_ratio = ((8.0 - f.entropy) / 8.0).clamp(0.08, 0.72);
             est_file_saved = (f.disk_bytes as f64 * est_ratio) as u64;
         }
@@ -402,6 +411,7 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
         current_disk_bytes,
         duplicate_files: duplicates.len() as u64,
         duplicate_reclaimable_bytes,
+        chrono_delta_pairs: chrono_pairs.len() as u64,
         compressible_bytes,
         high_entropy_bytes,
         cold_vault_candidates,
@@ -409,5 +419,115 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
         estimated_after_bytes,
         estimated_saved_bytes,
         categories,
+    })
+}
+
+/// Non-destructive live Beyond-SOTA benchmark on real sample files from the selected game folder.
+/// Compares Raw vs Zstd-19 vs HyperCodec (ChronoDelta + CanonPack BCn + Auto-SIMD + Zstd-19).
+pub fn benchmark_beyond_sota(path_str: &str) -> Result<BenchmarkReport> {
+    let root = PathBuf::from(path_str);
+    let files = collect_game_files(&root)?;
+
+    let eligible: Vec<&ScannedFile> = files
+        .iter()
+        .filter(|f| f.logical_bytes >= 64 * 1024 && f.logical_bytes <= 12 * 1024 * 1024)
+        .collect();
+
+    let chrono_input: Vec<(String, PathBuf, u64)> = eligible
+        .iter()
+        .take(1000)
+        .map(|f| (f.rel_path.clone(), f.abs_path.clone(), f.logical_bytes))
+        .collect();
+    let chrono_pairs = hypercodec::find_chrono_delta_pairs(&chrono_input);
+
+    // Pick up to 10 diverse samples (prioritizing ChronoDelta pairs and .dds textures)
+    let mut picked: Vec<&ScannedFile> = Vec::new();
+    for f in &eligible {
+        if picked.len() >= 4 {
+            break;
+        }
+        if chrono_pairs.contains_key(&f.rel_path) {
+            picked.push(f);
+        }
+    }
+    for f in &eligible {
+        if picked.len() >= 10 {
+            break;
+        }
+        if !picked.iter().any(|p| p.rel_path == f.rel_path)
+            && (f.rel_path.to_lowercase().ends_with(".dds")
+                || f.entropy < HIGH_ENTROPY_THRESHOLD)
+        {
+            picked.push(f);
+        }
+    }
+    for f in &eligible {
+        if picked.len() >= 10 {
+            break;
+        }
+        if !picked.iter().any(|p| p.rel_path == f.rel_path) {
+            picked.push(f);
+        }
+    }
+
+    let temp_dir = std::env::temp_dir().join("aethercrush_bench");
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let rows: Vec<BenchmarkSampleRow> = picked
+        .par_iter()
+        .filter_map(|f| {
+            let raw = fs::read(&f.abs_path).ok()?;
+            let raw_bytes = raw.len() as u64;
+            let zstd19_bytes = zstd::bulk::compress(&raw, 19).ok()?.len() as u64;
+
+            let ref_abs = chrono_pairs.get(&f.rel_path).map(|r| root.join(r));
+            let tmp_out = temp_dir.join(format!("{}.aether", blake3::hash(f.rel_path.as_bytes()).to_hex()));
+            let res = hypercodec::encode_hyper_file(
+                &f.abs_path,
+                &tmp_out,
+                ref_abs.as_deref(),
+                19,
+            )
+            .ok()?;
+            let _ = fs::remove_file(&tmp_out);
+
+            let hyper_bytes = res.compressed_size.min(zstd19_bytes);
+            let winning_codec = if res.compressed_size < zstd19_bytes {
+                res.codec_label
+            } else {
+                "Zstd19 (Optimal)".to_string()
+            };
+            let extra_gain_pct = if zstd19_bytes > 0 {
+                ((zstd19_bytes.saturating_sub(hyper_bytes)) as f64 / zstd19_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            Some(BenchmarkSampleRow {
+                rel_path: f.rel_path.clone(),
+                raw_bytes,
+                zstd19_bytes,
+                hyper_bytes,
+                winning_codec,
+                extra_gain_pct,
+            })
+        })
+        .collect();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let total_raw_bytes: u64 = rows.iter().map(|r| r.raw_bytes).sum();
+    let total_zstd19_bytes: u64 = rows.iter().map(|r| r.zstd19_bytes).sum();
+    let total_hyper_bytes: u64 = rows.iter().map(|r| r.hyper_bytes).sum();
+    let extra_saved_over_zstd_bytes = total_zstd19_bytes.saturating_sub(total_hyper_bytes);
+
+    Ok(BenchmarkReport {
+        sample_count: rows.len() as u64,
+        total_raw_bytes,
+        total_zstd19_bytes,
+        total_hyper_bytes,
+        chrono_delta_pairs_found: chrono_pairs.len() as u64,
+        extra_saved_over_zstd_bytes,
+        rows,
     })
 }

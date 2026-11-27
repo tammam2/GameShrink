@@ -14,6 +14,8 @@ export function formatModeLabel(mode: string): string {
       return "BRUTE MAX (ALL LZX)";
     case "adaptive_thermal":
       return "ADAPTIVE THERMAL";
+    case "hyper_archive":
+      return "HYPERARCHIVE (BEYOND-SOTA)";
     default:
       return mode.toUpperCase();
   }

@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionMode {
-    /// Default strongest mode: Intra-game hardlink dedup + NTFS LZX (smart entropy guard skips only uncompressible noise)
+    /// Strongest playable mode: Intra-game hardlink dedup + NTFS LZX (game runs directly from .exe)
     MaxCrush,
-    /// Forces NTFS LZX on every eligible file regardless of entropy + Intra-game hardlink dedup
+    /// Forces NTFS LZX on every eligible file regardless of entropy + Intra-game hardlinks
     BruteMax,
-    /// Zero-FPS adaptive: LZX on cold/load-once assets + XPRESS8K on streaming archives + Intra-game hardlink dedup
+    /// Zero-FPS adaptive: LZX on cold/load-once assets + XPRESS8K on streaming archives
     AdaptiveThermal,
+    /// Beyond-SOTA Deep Freeze: Stacks Intra-game Dedup + ChronoDelta LSH Residuals + CanonPack BCn + Auto-SIMD Bytecode + Zstd-19
+    HyperArchive,
 }
 
 impl CompressionMode {
@@ -17,14 +19,7 @@ impl CompressionMode {
             CompressionMode::MaxCrush => "max_crush",
             CompressionMode::BruteMax => "brute_max",
             CompressionMode::AdaptiveThermal => "adaptive_thermal",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "brute_max" => CompressionMode::BruteMax,
-            "adaptive_thermal" => CompressionMode::AdaptiveThermal,
-            _ => CompressionMode::MaxCrush,
+            CompressionMode::HyperArchive => "hyper_archive",
         }
     }
 }
@@ -113,6 +108,7 @@ pub struct ScanPreview {
     pub current_disk_bytes: u64,
     pub duplicate_files: u64,
     pub duplicate_reclaimable_bytes: u64,
+    pub chrono_delta_pairs: u64,
     pub compressible_bytes: u64,
     pub high_entropy_bytes: u64,
     pub cold_vault_candidates: u64,
@@ -120,6 +116,27 @@ pub struct ScanPreview {
     pub estimated_after_bytes: u64,
     pub estimated_saved_bytes: u64,
     pub categories: Vec<CategoryBreakdown>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkSampleRow {
+    pub rel_path: String,
+    pub raw_bytes: u64,
+    pub zstd19_bytes: u64,
+    pub hyper_bytes: u64,
+    pub winning_codec: String,
+    pub extra_gain_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkReport {
+    pub sample_count: u64,
+    pub total_raw_bytes: u64,
+    pub total_zstd19_bytes: u64,
+    pub total_hyper_bytes: u64,
+    pub chrono_delta_pairs_found: u64,
+    pub extra_saved_over_zstd_bytes: u64,
+    pub rows: Vec<BenchmarkSampleRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 [package]
 name = "aethercrush"
-version = "1.0.0"
-description = "High-ratio NTFS LZX + Intra-Game Hardlink Deduplication & Telemetry Ledger for Windows Games"
+version = "2.0.0"
+description = "Beyond-SOTA Game Compressor: NTFS LZX, Intra-Game Hardlinks, ChronoDelta LSH Residuals, CanonPack BCn & Auto-SIMD Bytecode"
 authors = ["AetherCrush"]
 edition = "2021"
 rust-version = "1.77"

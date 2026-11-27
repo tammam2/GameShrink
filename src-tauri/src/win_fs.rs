@@ -59,21 +59,17 @@ pub fn replace_with_hardlink(duplicate_path: &Path, canonical_path: &Path) -> Re
     let backup_path = duplicate_path.with_extension("aethercrush_hl_bak");
     std::fs::rename(duplicate_path, &backup_path)?;
 
-    let link_res = create_hardlink_native(duplicate_path, canonical_path);
-    match link_res {
+    match std::fs::hard_link(canonical_path, duplicate_path) {
         Ok(()) => {
             let _ = std::fs::remove_file(&backup_path);
             Ok(())
         }
         Err(e) => {
-            // Roll back safely
             let _ = std::fs::rename(&backup_path, duplicate_path);
-            Err(e)
+            Err(anyhow!("hard_link failed: {}", e))
         }
     }
 }
-
-fn create_hardlink_native(new_link: &Path, existing_target: &Path) -> Result<()> { std::fs::hard_link(existing_target, new_link)?; Ok(()) }
 
 /// Breaks an NTFS hardlink by cloning the file data to a fresh independent inode.
 pub fn break_hardlink(path: &Path) -> Result<()> {

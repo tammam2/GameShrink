@@ -430,7 +430,7 @@ impl LedgerDb {
                 COALESCE(SUM(lzx_saved_bytes), 0),
                 COALESCE(SUM(vault_saved_bytes), 0)
             FROM games
-            WHERE status = 'compressed'
+            WHERE status IN ('compressed', 'archived')
             ",
             [],
             |row| {
