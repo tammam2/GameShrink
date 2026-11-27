@@ -718,17 +718,22 @@ pub fn run_ultra_play_session(
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("Invalid exe filename"))?;
     let orig_exe = exe_dir.join(format!("{}.gs_orig", exe_name));
-    let launch_target = if orig_exe.exists() {
-        orig_exe
+    let temp_shim = exe_dir.join(format!("{}.gs_shim", exe_name));
+    let swapped = if orig_exe.exists() {
+        let _ = fs::rename(&exe_path, &temp_shim);
+        win_fs::set_hidden(&orig_exe, false);
+        fs::rename(&orig_exe, &exe_path).is_ok()
     } else {
-        exe_path.clone()
+        false
     };
-
-    let mut child = Command::new(&launch_target)
-        .current_dir(exe_dir)
-        .args(extra_args)
-        .spawn()?;
-    let _ = child.wait();
+    if let Ok(mut child) = Command::new(&exe_path).current_dir(exe_dir).args(extra_args).spawn() {
+        let _ = child.wait();
+    }
+    if swapped {
+        let _ = fs::rename(&exe_path, &orig_exe);
+        win_fs::set_hidden(&orig_exe, true);
+        let _ = fs::rename(&temp_shim, &exe_path);
+    }
 
     // Step 4: Instant Zero-Recompress Re-Seal on Exit!
     // Unchanged files simply delete their temp unpacked copy because `.gsh` is already in `.gameshrink_vault/`.
