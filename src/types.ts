@@ -2,14 +2,15 @@ export type CompressionMode =
   | "max_crush"
   | "brute_max"
   | "adaptive_thermal"
-  | "hyper_archive";
+  | "ultra_auto_launch";
 
 export interface CompressRequest {
   path: string;
   name?: string;
   mode: CompressionMode;
   enable_hardlink_dedup: boolean;
-  enable_cold_vault: boolean;
+  clean_redist_bloat: boolean;
+  only_uncompressed: boolean;
 }
 
 export interface GameRecord {
@@ -82,11 +83,10 @@ export interface ScanPreview {
   current_disk_bytes: number;
   duplicate_files: number;
   duplicate_reclaimable_bytes: number;
-  chrono_delta_pairs: number;
+  bloat_files: number;
+  bloat_bytes: number;
   compressible_bytes: number;
   high_entropy_bytes: number;
-  cold_vault_candidates: number;
-  cold_vault_bytes: number;
   estimated_after_bytes: number;
   estimated_saved_bytes: number;
   categories: CategoryBreakdown[];
@@ -95,7 +95,6 @@ export interface ScanPreview {
 export interface ModeEstimate {
   mode: string;
   label: string;
-  playable_directly: boolean;
   estimated_after_bytes: number;
   estimated_saved_bytes: number;
   estimated_saved_pct: number;
@@ -105,6 +104,7 @@ export interface BenchmarkReport {
   sample_count: number;
   total_game_bytes: number;
   duplicate_saved_bytes: number;
+  bloat_saved_bytes: number;
   estimates: ModeEstimate[];
 }
 
@@ -134,4 +134,17 @@ export interface ProgressEvent {
   total_files: number;
   saved_so_far_bytes: number;
   pct: number;
+}
+
+export interface GameUpdateNotice {
+  game_id: string;
+  game_name: string;
+  uncompressed_files: number;
+  uncompressed_bytes: number;
+}
+
+export interface WatcherStatus {
+  enabled: boolean;
+  auto_recompress: boolean;
+  pending_updates: GameUpdateNotice[];
 }

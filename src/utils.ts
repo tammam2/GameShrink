@@ -14,8 +14,8 @@ export function formatModeLabel(mode: string): string {
       return "Playable Extreme";
     case "adaptive_thermal":
       return "Playable Balanced";
-    case "hyper_archive":
-      return "Deep Freeze";
+    case "ultra_auto_launch":
+      return "Ultra Pack (Auto-Launch)";
     default:
       return mode;
   }

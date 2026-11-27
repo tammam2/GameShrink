@@ -26,6 +26,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Build gs_shim proxy launcher
+        shell: pwsh
+        run: |
+          cargo build --release --bin gs_shim --manifest-path src-tauri/Cargo.toml
+          New-Item -ItemType Directory -Force -Path src-tauri/resources
+          Copy-Item src-tauri/target/release/gs_shim.exe src-tauri/resources/gs_shim.exe -Force
+
       - name: Build Tauri NSIS & MSI installers
         uses: tauri-apps/tauri-action@v0
         env:
@@ -33,6 +40,6 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: "GameShrink v__VERSION__"
-          releaseBody: "Windows NSIS (.exe) and MSI installers for GameShrink."
+          releaseBody: "Windows NSIS (.exe) and MSI installers for GameShrink v__VERSION__."
           releaseDraft: true
           prerelease: false

@@ -3,11 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
-  Archive,
   ArrowLeft,
   BarChart3,
   CheckCircle2,
   Copy,
+  Eye,
   FileSearch,
   Flame,
   FolderOpen,
@@ -15,11 +15,12 @@ import {
   HardDrive,
   Layers,
   Play,
+  RefreshCw,
+  Rocket,
   RotateCcw,
   Search,
   ShieldAlert,
   ShieldCheck,
-  Snowflake,
   Sparkles,
   Square,
   Trash2,
@@ -34,6 +35,7 @@ import {
   ModeEstimate,
   ProgressEvent,
   ScanPreview,
+  WatcherStatus,
 } from "./types";
 import { formatBytes, formatDate, formatModeLabel } from "./utils";
 
@@ -43,41 +45,47 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
   const [games, setGames] = useState<GameRecord[]>([]);
   const [stats, setStats] = useState<GlobalStats | null>(null);
+  const [watcher, setWatcher] = useState<WatcherStatus>({
+    enabled: true,
+    auto_recompress: false,
+    pending_updates: [],
+  });
   const [selectedDetail, setSelectedDetail] = useState<GameDetailResponse | null>(null);
 
-  // Compress flow state
   const [folderPath, setFolderPath] = useState("");
   const [customName, setCustomName] = useState("");
-  const [mode, setMode] = useState<CompressionMode>("max_crush");
+  const [mode, setMode] = useState<CompressionMode>("ultra_auto_launch");
   const [enableHardlinks, setEnableHardlinks] = useState(true);
-  const [enableColdVault, setEnableColdVault] = useState(false);
+  const [cleanBloat, setCleanBloat] = useState(false);
   const [scanPreview, setScanPreview] = useState<ScanPreview | null>(null);
   const [benchmark, setBenchmark] = useState<BenchmarkReport | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [isBenchRunning, setIsBenchRunning] = useState(false);
+  const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [progress, setProgress] = useState<ProgressEvent | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
-  // Details filters
   const [auditSearch, setAuditSearch] = useState("");
   const [auditFilter, setAuditFilter] = useState("ALL");
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
-    setTimeout(() => setToastMsg(null), 4500);
+    setTimeout(() => setToastMsg(null), 5000);
   };
 
   const refreshLibrary = async () => {
     try {
-      const [gList, gStats] = await Promise.all([
+      const [gList, gStats, wStatus] = await Promise.all([
         invoke<GameRecord[]>("list_games"),
         invoke<GlobalStats>("get_global_stats"),
+        invoke<WatcherStatus>("get_watcher_status"),
       ]);
       setGames(gList);
       setStats(gStats);
+      setWatcher(wStatus);
     } catch (e) {
       setErrorMsg(String(e));
     }
@@ -85,13 +93,47 @@ export default function App() {
 
   useEffect(() => {
     refreshLibrary();
-    const unlistenPromise = listen<ProgressEvent>("compression-progress", (event) => {
+    const unlistenProgress = listen<ProgressEvent>("compression-progress", (event) => {
       setProgress(event.payload);
     });
+    const unlistenWatcher = listen<WatcherStatus>("watcher-update", (event) => {
+      setWatcher(event.payload);
+      refreshLibrary();
+    });
     return () => {
-      unlistenPromise.then((fn) => fn());
+      unlistenProgress.then((fn) => fn());
+      unlistenWatcher.then((fn) => fn());
     };
   }, []);
+
+  const handleToggleWatcher = async (enabled: boolean, autoRecompress: boolean) => {
+    try {
+      const updated = await invoke<WatcherStatus>("set_watcher_settings", {
+        enabled,
+        autoRecompress,
+      });
+      setWatcher(updated);
+    } catch (e) {
+      setErrorMsg(String(e));
+    }
+  };
+
+  const handleCheckUpdatesNow = async () => {
+    setIsCheckingUpdates(true);
+    try {
+      const updated = await invoke<WatcherStatus>("check_updates_now");
+      setWatcher(updated);
+      if (updated.pending_updates.length === 0) {
+        showToast("All compressed games are up to date.");
+      } else {
+        showToast(`Found updated uncompressed files in ${updated.pending_updates.length} game(s).`);
+      }
+    } catch (e) {
+      setErrorMsg(String(e));
+    } finally {
+      setIsCheckingUpdates(false);
+    }
+  };
 
   const handlePickFolder = async () => {
     setErrorMsg(null);
@@ -121,7 +163,7 @@ export default function App() {
       setScanPreview(preview);
       setCustomName(preview.suggested_name);
       if (preview.anti_cheat_detected) {
-        setEnableColdVault(false);
+        setMode("max_crush");
       }
     } catch (e) {
       setErrorMsg(String(e));
@@ -175,14 +217,19 @@ export default function App() {
           name: customName.trim() || null,
           mode,
           enable_hardlink_dedup: enableHardlinks,
-          enable_cold_vault: enableColdVault && !(scanPreview?.anti_cheat_detected ?? false),
+          clean_redist_bloat: cleanBloat,
+          only_uncompressed: false,
         },
       });
       await refreshLibrary();
       await openInspector(record.id);
       if (record.status === "cancelled") {
         showToast(
-          `Compression cancelled safely. Saved ${formatBytes(record.saved_bytes)} on files already processed.`
+          `Compression cancelled safely. Saved ${formatBytes(record.saved_bytes)} on processed files.`
+        );
+      } else if (record.mode === "ultra_auto_launch") {
+        showToast(
+          `Ultra Pack ready for ${record.name}! Saved ${formatBytes(record.saved_bytes)} (${record.ratio_pct.toFixed(1)}%). Double-click its .exe anytime to auto-unpack, play & instant re-seal.`
         );
       } else {
         showToast(
@@ -194,6 +241,68 @@ export default function App() {
     } finally {
       setIsRunning(false);
       setIsCancelling(false);
+    }
+  };
+
+  const handleRecompress = async (game: GameRecord, onlyUncompressed: boolean, newMode?: CompressionMode) => {
+    setIsRunning(true);
+    setIsCancelling(false);
+    setErrorMsg(null);
+    setProgress({
+      phase: onlyUncompressed ? "Re-Compressing Updated Files" : "Re-Compressing Full Game",
+      current_file: game.name,
+      processed_files: 0,
+      total_files: game.files_total || 1,
+      saved_so_far_bytes: 0,
+      pct: 0,
+    });
+    try {
+      const record = await invoke<GameRecord>("recompress_game", {
+        gameId: game.id,
+        mode: newMode ?? null,
+        onlyUncompressed,
+      });
+      await refreshLibrary();
+      if (selectedDetail?.game.id === game.id) {
+        await openInspector(game.id);
+      }
+      if (record.status === "cancelled") {
+        showToast("Re-compression cancelled safely.");
+      } else {
+        showToast(
+          `Re-compressed ${record.name} — Total saved: ${formatBytes(record.saved_bytes)} (${record.ratio_pct.toFixed(1)}%)`
+        );
+      }
+    } catch (e) {
+      setErrorMsg(String(e));
+    } finally {
+      setIsRunning(false);
+      setIsCancelling(false);
+    }
+  };
+
+  const handlePlayGame = async (game: GameRecord) => {
+    setErrorMsg(null);
+    if (game.mode === "ultra_auto_launch" || game.status === "archived") {
+      showToast(`Unpacking ${game.name} to play... It will instantly re-seal when you close the game.`);
+      try {
+        await invoke("play_ultra_game", { gameId: game.id });
+        showToast(`${game.name} closed — Instantly re-sealed back to compressed size!`);
+      } catch (e) {
+        setErrorMsg(String(e));
+      }
+      return;
+    }
+
+    if (!game.exe_path) {
+      setErrorMsg("No game .exe was found automatically in this folder.");
+      return;
+    }
+    try {
+      await invoke("launch_game_exe", { exePath: game.exe_path });
+      showToast("Game launched directly from its .exe.");
+    } catch (e) {
+      setErrorMsg(String(e));
     }
   };
 
@@ -226,26 +335,13 @@ export default function App() {
       if (res.status === "cancelled") {
         showToast("Restore stopped by user.");
       } else {
-        showToast(`Restored ${game.name} to its original uncompressed files.`);
+        showToast(`Restored ${game.name} and its original .exe cleanly.`);
       }
     } catch (e) {
       setErrorMsg(String(e));
     } finally {
       setIsRunning(false);
       setIsCancelling(false);
-    }
-  };
-
-  const handleLaunchExe = async (exePath: string | null) => {
-    if (!exePath) {
-      setErrorMsg("No game .exe was found automatically in this folder.");
-      return;
-    }
-    try {
-      await invoke("launch_game_exe", { exePath });
-      showToast("Game launched directly from its .exe.");
-    } catch (e) {
-      setErrorMsg(String(e));
     }
   };
 
@@ -275,6 +371,10 @@ export default function App() {
     return benchmark?.estimates.find((e) => e.mode === m);
   };
 
+  const getPendingUpdate = (gameId: string) => {
+    return watcher.pending_updates.find((u) => u.game_id === gameId);
+  };
+
   const filteredAudits = useMemo(() => {
     if (!selectedDetail) return [];
     const q = auditSearch.trim().toLowerCase();
@@ -283,8 +383,8 @@ export default function App() {
         auditFilter === "ALL" ||
         (auditFilter === "COMPRESSED"
           ? a.action === "Max Compressed" || a.action === "Fast Compressed"
-          : auditFilter === "DEEP"
-            ? a.action.startsWith("Deep Freeze") || a.action === "Archived Language"
+          : auditFilter === "ULTRA"
+            ? a.action.startsWith("Ultra")
             : a.action === auditFilter);
       const matchQuery =
         !q ||
@@ -299,27 +399,34 @@ export default function App() {
     <div className="flex h-screen w-screen overflow-hidden bg-[#060911] text-slate-100">
       {/* Sidebar */}
       <aside className="flex w-64 flex-col border-r border-slate-800/80 bg-[#090d17] p-5">
-        <div className="mb-8 flex items-center gap-3">
+        <div className="mb-7 flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500 to-cyan-500 shadow-lg shadow-emerald-500/20">
             <Flame className="h-5 w-5 text-slate-950" />
           </div>
           <div>
             <h1 className="text-base font-bold tracking-tight text-white">GameShrink</h1>
-            <p className="text-[11px] font-medium text-emerald-400">Smart Game Compressor</p>
+            <p className="text-[11px] font-medium text-emerald-400">Ultra + Direct Play</p>
           </div>
         </div>
 
         <nav className="flex flex-col gap-1.5">
           <button
             onClick={() => setTab("dashboard")}
-            className={`flex items-center gap-3 rounded-xl px-3.5 py-2.5 text-sm font-medium transition ${
+            className={`flex items-center justify-between rounded-xl px-3.5 py-2.5 text-sm font-medium transition ${
               tab === "dashboard"
                 ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30"
                 : "text-slate-400 hover:bg-slate-800/60 hover:text-slate-200"
             }`}
           >
-            <HardDrive className="h-4 w-4" />
-            My Games
+            <span className="flex items-center gap-3">
+              <HardDrive className="h-4 w-4" />
+              My Games
+            </span>
+            {watcher.pending_updates.length > 0 && (
+              <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-bold text-amber-300">
+                {watcher.pending_updates.length}
+              </span>
+            )}
           </button>
 
           <button
@@ -349,6 +456,43 @@ export default function App() {
           )}
         </nav>
 
+        {/* Live Update Watcher Card */}
+        <div className="mt-6 rounded-2xl border border-slate-800/90 bg-[#0d1322] p-3.5">
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5 text-xs font-bold text-slate-200">
+              <Eye className={`h-3.5 w-3.5 ${watcher.enabled ? "text-emerald-400" : "text-slate-500"}`} />
+              Live Update Watcher
+            </span>
+            <input
+              type="checkbox"
+              checked={watcher.enabled}
+              onChange={(e) => handleToggleWatcher(e.target.checked, watcher.auto_recompress)}
+              className="h-3.5 w-3.5 accent-emerald-500"
+            />
+          </div>
+          <p className="mt-1 text-[11px] leading-snug text-slate-400">
+            Detects when a game patch adds uncompressed files.
+          </p>
+          <label className="mt-2.5 flex cursor-pointer items-center justify-between text-[11px] text-slate-300">
+            <span>Auto re-compress patches</span>
+            <input
+              type="checkbox"
+              disabled={!watcher.enabled}
+              checked={watcher.auto_recompress}
+              onChange={(e) => handleToggleWatcher(watcher.enabled, e.target.checked)}
+              className="h-3.5 w-3.5 accent-cyan-500"
+            />
+          </label>
+          <button
+            onClick={handleCheckUpdatesNow}
+            disabled={isCheckingUpdates || isRunning}
+            className="mt-2.5 flex w-full items-center justify-center gap-1.5 rounded-lg bg-slate-800 py-1.5 text-[11px] font-semibold text-slate-200 hover:bg-slate-700 disabled:opacity-40"
+          >
+            <RefreshCw className={`h-3 w-3 ${isCheckingUpdates ? "animate-spin" : ""}`} />
+            {isCheckingUpdates ? "Checking..." : "Check Updates Now"}
+          </button>
+        </div>
+
         {/* Total Saved Widget */}
         <div className="mt-auto rounded-2xl border border-emerald-500/20 bg-gradient-to-b from-emerald-500/10 to-slate-900/60 p-4">
           <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-400">
@@ -360,20 +504,6 @@ export default function App() {
           <p className="mt-1 text-xs text-slate-400">
             Across {stats?.total_games ?? 0} game{(stats?.total_games ?? 0) === 1 ? "" : "s"}
           </p>
-          <div className="mt-3 space-y-1 text-[11px] text-slate-400">
-            <div className="flex justify-between">
-              <span>Playable Compression:</span>
-              <span className="text-slate-200">{formatBytes(stats?.total_lzx_saved_bytes ?? 0)}</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Duplicate Files:</span>
-              <span className="text-amber-300">{formatBytes(stats?.total_dedup_saved_bytes ?? 0)}</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Deep Freeze:</span>
-              <span className="text-indigo-300">{formatBytes(stats?.total_vault_saved_bytes ?? 0)}</span>
-            </div>
-          </div>
         </div>
       </aside>
 
@@ -440,7 +570,7 @@ export default function App() {
               <div>
                 <h2 className="text-2xl font-bold text-white">My Compressed Games</h2>
                 <p className="mt-1 text-sm text-slate-400">
-                  Track before & after sizes, launch playable games directly from their .exe, or restore anytime.
+                  Double-click any game&apos;s .exe as usual. Ultra Pack games auto-unpack to play and instantly re-seal when closed.
                 </p>
               </div>
               <button
@@ -472,11 +602,11 @@ export default function App() {
               </div>
 
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
-                <p className="text-xs text-slate-400">Deep Freeze Savings</p>
+                <p className="text-xs text-slate-400">Ultra Pack Savings</p>
                 <p className="mt-1.5 text-2xl font-bold text-indigo-300">
                   {formatBytes(stats?.total_vault_saved_bytes ?? 0)}
                 </p>
-                <p className="mt-1 text-[11px] text-slate-500">Stored games & unused voices</p>
+                <p className="mt-1 text-[11px] text-slate-500">Auto-launch + Instant Re-Seal</p>
               </div>
 
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
@@ -495,7 +625,7 @@ export default function App() {
                 <HardDrive className="mb-3 h-10 w-10 text-slate-600" />
                 <h3 className="text-base font-semibold text-slate-200">No compressed games yet</h3>
                 <p className="mt-1 max-w-md text-sm text-slate-400">
-                  Pick any game folder to see how much space each option will save, then shrink it with one click.
+                  Pick any game folder to compare space savings across all 4 options, including Ultra Pack (Auto-Launch + Instant Re-Seal).
                 </p>
                 <button
                   onClick={() => setTab("compress")}
@@ -508,7 +638,8 @@ export default function App() {
               <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
                 {games.map((g) => {
                   const keepPct = g.before_bytes > 0 ? (g.after_bytes / g.before_bytes) * 100 : 100;
-                  const isArchived = g.status === "archived";
+                  const pending = getPendingUpdate(g.id);
+                  const isUltra = g.mode === "ultra_auto_launch";
                   return (
                     <div
                       key={g.id}
@@ -520,25 +651,20 @@ export default function App() {
                             <h3 className="truncate text-base font-bold text-white">{g.name}</h3>
                             <span
                               className={`rounded-md px-2 py-0.5 text-[10px] font-semibold ${
-                                isArchived
+                                isUltra
                                   ? "bg-indigo-500/20 text-indigo-300"
                                   : "bg-emerald-500/15 text-emerald-300"
                               }`}
                             >
                               {formatModeLabel(g.mode)}
                             </span>
-                            {g.status === "cancelled" && (
-                              <span className="rounded-md bg-rose-500/15 px-2 py-0.5 text-[10px] font-semibold text-rose-300">
-                                Partial (Cancelled)
-                              </span>
-                            )}
                             {g.anti_cheat_detected && (
                               <span
                                 title={`Detected: ${g.anti_cheat_name}`}
                                 className="flex items-center gap-1 rounded-md bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-300"
                               >
                                 <ShieldCheck className="h-3 w-3" />
-                                Anti-Cheat Safe
+                                Anti-Cheat
                               </span>
                             )}
                           </div>
@@ -554,6 +680,21 @@ export default function App() {
                         </div>
                       </div>
 
+                      {pending && (
+                        <div className="mt-3 flex items-center justify-between rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                          <span>
+                            Game updated: <strong>{pending.uncompressed_files}</strong> new files ({formatBytes(pending.uncompressed_bytes)})
+                          </span>
+                          <button
+                            onClick={() => handleRecompress(g, true)}
+                            disabled={isRunning}
+                            className="ml-2 shrink-0 rounded-lg bg-amber-400 px-2.5 py-1 text-[11px] font-bold text-slate-950 hover:bg-amber-300 disabled:opacity-40"
+                          >
+                            Re-Compress Updates
+                          </button>
+                        </div>
+                      )}
+
                       <div className="mt-4">
                         <div className="mb-1.5 flex justify-between text-xs">
                           <span className="text-slate-400">
@@ -566,7 +707,7 @@ export default function App() {
                         <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
                           <div
                             className={`h-full rounded-full ${
-                              isArchived
+                              isUltra
                                 ? "bg-gradient-to-r from-indigo-500 to-cyan-400"
                                 : "bg-gradient-to-r from-cyan-500 to-emerald-400"
                             }`}
@@ -575,26 +716,23 @@ export default function App() {
                         </div>
                       </div>
 
-                      <div className="mt-4 flex items-center gap-2 border-t border-slate-800/80 pt-3.5">
-                        {isArchived ? (
+                      <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-800/80 pt-3.5">
+                        <button
+                          onClick={() => handlePlayGame(g)}
+                          className="flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/25"
+                        >
+                          <Play className="h-3.5 w-3.5" />
+                          {isUltra ? "Auto-Play" : "Play"}
+                        </button>
+                        {!isUltra && (
                           <button
-                            onClick={() => handleRestore(g)}
+                            onClick={() => handleRecompress(g, true)}
                             disabled={isRunning}
-                            className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 px-3 py-1.5 text-xs font-semibold text-indigo-200 hover:bg-indigo-500/30 disabled:opacity-40"
+                            className="flex items-center gap-1.5 rounded-lg bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold text-cyan-300 hover:bg-cyan-500/25 disabled:opacity-40"
                           >
-                            <RotateCcw className="h-3.5 w-3.5" />
-                            Unpack to Play
+                            <RefreshCw className="h-3.5 w-3.5" />
+                            Re-Compress
                           </button>
-                        ) : (
-                          g.exe_path && (
-                            <button
-                              onClick={() => handleLaunchExe(g.exe_path)}
-                              className="flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/25"
-                            >
-                              <Play className="h-3.5 w-3.5" />
-                              Play Game
-                            </button>
-                          )
                         )}
                         <button
                           onClick={() => openInspector(g.id)}
@@ -610,19 +748,17 @@ export default function App() {
                         >
                           <FolderOpen className="h-3.5 w-3.5" />
                         </button>
-                        {!isArchived && (
-                          <button
-                            onClick={() => handleRestore(g)}
-                            disabled={isRunning}
-                            className="ml-auto flex items-center gap-1 rounded-lg bg-slate-800/70 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-amber-500/20 hover:text-amber-200 disabled:opacity-40"
-                          >
-                            <RotateCcw className="h-3.5 w-3.5" />
-                            Restore
-                          </button>
-                        )}
+                        <button
+                          onClick={() => handleRestore(g)}
+                          disabled={isRunning}
+                          className="ml-auto flex items-center gap-1 rounded-lg bg-slate-800/70 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-amber-500/20 hover:text-amber-200 disabled:opacity-40"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          Restore
+                        </button>
                         <button
                           onClick={() => handleDeleteRecord(g.id)}
-                          className={`${isArchived ? "ml-auto" : ""} rounded-lg p-1.5 text-slate-500 hover:bg-rose-500/15 hover:text-rose-300`}
+                          className="rounded-lg p-1.5 text-slate-500 hover:bg-rose-500/15 hover:text-rose-300"
                           title="Remove from history"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
@@ -642,11 +778,10 @@ export default function App() {
             <div>
               <h2 className="text-2xl font-bold text-white">Compress a Game</h2>
               <p className="mt-1 text-sm text-slate-400">
-                Choose a game folder, estimate how much space each option will save, and start shrinking.
+                Choose between instant direct-play compression or <strong>Ultra Pack (Auto-Launch)</strong> with an automatic proxy .exe and Instant Re-Seal.
               </p>
             </div>
 
-            {/* Folder Picker */}
             <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-5">
               <label className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                 1. Choose Game Folder
@@ -679,7 +814,6 @@ export default function App() {
 
             {scanPreview && (
               <div className="space-y-5">
-                {/* Folder Summary + Estimate Savings Button */}
                 <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-5">
                   <div className="flex flex-wrap items-center justify-between gap-4">
                     <div>
@@ -690,7 +824,7 @@ export default function App() {
                         className="bg-transparent text-xl font-bold text-white focus:outline-none"
                       />
                       <p className="mt-0.5 text-xs text-slate-400">
-                        {scanPreview.total_files.toLocaleString()} files • Game executable:{" "}
+                        {scanPreview.total_files.toLocaleString()} files • Main executable:{" "}
                         <span className="text-slate-200">
                           {scanPreview.detected_exe ? scanPreview.detected_exe.split(/[\\/]/).pop() : "Not detected"}
                         </span>
@@ -710,12 +844,12 @@ export default function App() {
                       {scanPreview.anti_cheat_detected ? (
                         <div className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
                           <ShieldAlert className="h-4 w-4 text-amber-400" />
-                          <span>{scanPreview.anti_cheat_name} detected</span>
+                          <span>{scanPreview.anti_cheat_name} (Use Playable modes)</span>
                         </div>
                       ) : (
                         <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
                           <ShieldCheck className="h-4 w-4 text-emerald-400" />
-                          <span>No Anti-Cheat</span>
+                          <span>All Modes Safe</span>
                         </div>
                       )}
                     </div>
@@ -749,7 +883,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Benchmark Comparison Table (Shown after clicking Estimate Savings) */}
                 {benchmark && (
                   <div className="rounded-2xl border border-indigo-500/30 bg-[#0b1122] p-5">
                     <div className="mb-3 flex items-center justify-between">
@@ -779,7 +912,7 @@ export default function App() {
                             Save ~{formatBytes(est.estimated_saved_bytes)}
                           </p>
                           <p className="text-[11px] text-slate-400">
-                            Final size: ~{formatBytes(est.estimated_after_bytes)} (-{est.estimated_saved_pct.toFixed(1)}%)
+                            Final: ~{formatBytes(est.estimated_after_bytes)} (-{est.estimated_saved_pct.toFixed(1)}%)
                           </p>
                         </div>
                       ))}
@@ -787,7 +920,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* 2. Choose Compression Option */}
                 <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-5">
                   <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                     2. Choose Compression Option
@@ -796,22 +928,31 @@ export default function App() {
                     {(
                       [
                         {
+                          id: "ultra_auto_launch" as CompressionMode,
+                          title: "Ultra Pack",
+                          badge: "Max Savings • Auto-Launch",
+                          badgeColor: "bg-indigo-500/20 text-indigo-300",
+                          borderActive: "border-indigo-400 bg-indigo-500/15",
+                          icon: <Rocket className="h-4 w-4 text-indigo-300" />,
+                          desc: "Our strongest custom codec (Smart Delta + Texture Pack + Zstd-19). Replaces game.exe with an auto-launcher that unpacks to play & instantly re-seals on exit.",
+                        },
+                        {
                           id: "max_crush" as CompressionMode,
                           title: "Playable Max",
-                          badge: "Recommended • Play Directly",
+                          badge: "Instant Play • Safe",
                           badgeColor: "bg-emerald-500/15 text-emerald-300",
                           borderActive: "border-emerald-500 bg-emerald-500/10",
                           icon: <Flame className="h-4 w-4 text-emerald-400" />,
-                          desc: "Strongest compression while staying 100% playable from your .exe. Skips already-compressed files.",
+                          desc: "Strongest native Windows compression (LZX). Zero unpack wait and 100% anti-cheat safe.",
                         },
                         {
                           id: "brute_max" as CompressionMode,
                           title: "Playable Extreme",
-                          badge: "Play Directly",
+                          badge: "Instant Play • Force All",
                           badgeColor: "bg-cyan-500/15 text-cyan-300",
                           borderActive: "border-cyan-500 bg-cyan-500/10",
                           icon: <Sparkles className="h-4 w-4 text-cyan-400" />,
-                          desc: "Forces maximum Windows compression on every single file to squeeze out every last MB.",
+                          desc: "Forces maximum Windows LZX compression on every single file regardless of type.",
                         },
                         {
                           id: "adaptive_thermal" as CompressionMode,
@@ -820,28 +961,24 @@ export default function App() {
                           badgeColor: "bg-purple-500/15 text-purple-300",
                           borderActive: "border-purple-500 bg-purple-500/10",
                           icon: <Gauge className="h-4 w-4 text-purple-400" />,
-                          desc: "Best for massive open-world games. Uses high compression on static files and fast compression on maps.",
-                        },
-                        {
-                          id: "hyper_archive" as CompressionMode,
-                          title: "Deep Freeze",
-                          badge: "Smallest Size • Unpack to Play",
-                          badgeColor: "bg-indigo-500/20 text-indigo-300",
-                          borderActive: "border-indigo-400 bg-indigo-500/15",
-                          icon: <Snowflake className="h-4 w-4 text-indigo-300" />,
-                          desc: "Absolute maximum space savings for games you aren't playing right now. 1-click Unpack when ready.",
+                          desc: "Best for open-world games. High compression on static files, fast compression on streaming maps.",
                         },
                       ] as const
                     ).map((opt) => {
                       const est = getEstimateForMode(opt.id);
+                      const disabledUltra =
+                        opt.id === "ultra_auto_launch" && scanPreview.anti_cheat_detected;
                       return (
                         <button
                           key={opt.id}
+                          disabled={disabledUltra}
                           onClick={() => setMode(opt.id)}
                           className={`flex flex-col rounded-xl border p-4 text-left transition ${
-                            mode === opt.id
-                              ? opt.borderActive
-                              : "border-slate-800 bg-[#060911] hover:border-slate-700"
+                            disabledUltra
+                              ? "cursor-not-allowed border-slate-800/50 bg-[#060911] opacity-40"
+                              : mode === opt.id
+                                ? opt.borderActive
+                                : "border-slate-800 bg-[#060911] hover:border-slate-700"
                           }`}
                         >
                           <div className="flex w-full items-center justify-between">
@@ -849,10 +986,10 @@ export default function App() {
                             {opt.icon}
                           </div>
                           <span className={`mt-1.5 inline-block w-fit rounded px-1.5 py-0.5 text-[10px] font-semibold ${opt.badgeColor}`}>
-                            {opt.badge}
+                            {disabledUltra ? "Blocked (Anti-Cheat)" : opt.badge}
                           </span>
                           <p className="mt-2 text-[11px] leading-relaxed text-slate-400">{opt.desc}</p>
-                          {est && (
+                          {est && !disabledUltra && (
                             <p className="mt-auto pt-2.5 text-xs font-bold text-emerald-400">
                               Est. Save: ~{formatBytes(est.estimated_saved_bytes)} (-{est.estimated_saved_pct.toFixed(0)}%)
                             </p>
@@ -862,7 +999,6 @@ export default function App() {
                     })}
                   </div>
 
-                  {/* Extra Space-Saving Options */}
                   <div className="mt-4 space-y-3 border-t border-slate-800/80 pt-4">
                     <label className="flex cursor-pointer items-center justify-between rounded-xl bg-[#060911] px-4 py-3">
                       <div className="flex items-center gap-3">
@@ -872,7 +1008,7 @@ export default function App() {
                             Merge Duplicate Files Inside This Game (Safe)
                           </p>
                           <p className="text-xs text-slate-400">
-                            Replaces identical copies inside this game with a single shared file. Zero FPS cost and safe when uninstalling.
+                            Replaces identical copies inside this game with one shared file. Zero FPS cost and safe on uninstall.
                           </p>
                         </div>
                       </div>
@@ -884,32 +1020,25 @@ export default function App() {
                       />
                     </label>
 
-                    {mode !== "hyper_archive" && (
-                      <label
-                        className={`flex items-center justify-between rounded-xl bg-[#060911] px-4 py-3 ${
-                          scanPreview.anti_cheat_detected ? "opacity-50" : "cursor-pointer"
-                        }`}
-                      >
+                    {scanPreview.bloat_files > 0 && (
+                      <label className="flex cursor-pointer items-center justify-between rounded-xl bg-[#060911] px-4 py-3">
                         <div className="flex items-center gap-3">
-                          <Archive className="h-4 w-4 text-cyan-400" />
+                          <Trash2 className="h-4 w-4 text-rose-400" />
                           <div>
                             <p className="text-sm font-medium text-white">
-                              Archive Unused Foreign Voice Packs ({scanPreview.cold_vault_candidates} found •{" "}
-                              {formatBytes(scanPreview.cold_vault_bytes)})
+                              Clean Unused Redistributable & Debug Bloat ({scanPreview.bloat_files} files •{" "}
+                              {formatBytes(scanPreview.bloat_bytes)})
                             </p>
                             <p className="text-xs text-slate-400">
-                              {scanPreview.anti_cheat_detected
-                                ? "Disabled automatically because anti-cheat was detected."
-                                : "Packs unused non-English voice files tightly with 1-click restore anytime."}
+                              Removes leftover DirectX/vcredist installers, crash dumps, and .pdb debug files.
                             </p>
                           </div>
                         </div>
                         <input
                           type="checkbox"
-                          disabled={scanPreview.anti_cheat_detected}
-                          checked={enableColdVault}
-                          onChange={(e) => setEnableColdVault(e.target.checked)}
-                          className="h-4 w-4 accent-cyan-500"
+                          checked={cleanBloat}
+                          onChange={(e) => setCleanBloat(e.target.checked)}
+                          className="h-4 w-4 accent-rose-500"
                         />
                       </label>
                     )}
@@ -919,12 +1048,12 @@ export default function App() {
                     onClick={handleCompress}
                     disabled={isRunning}
                     className={`mt-5 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-sm font-bold text-slate-950 shadow-lg transition hover:brightness-110 disabled:opacity-50 ${
-                      mode === "hyper_archive"
+                      mode === "ultra_auto_launch"
                         ? "bg-gradient-to-r from-indigo-400 to-cyan-400 shadow-indigo-500/20"
                         : "bg-gradient-to-r from-emerald-500 to-cyan-500 shadow-emerald-500/20"
                     }`}
                   >
-                    {mode === "hyper_archive" ? <Snowflake className="h-4 w-4" /> : <Flame className="h-4 w-4" />}
+                    {mode === "ultra_auto_launch" ? <Rocket className="h-4 w-4" /> : <Flame className="h-4 w-4" />}
                     {isRunning ? "Compressing..." : `Start ${formatModeLabel(mode)}`}
                   </button>
                 </div>
@@ -936,7 +1065,7 @@ export default function App() {
         {/* TAB 3: GAME DETAILS & FILE HISTORY */}
         {tab === "inspector" && selectedDetail && (
           <div className="space-y-6">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-3">
                 <button
                   onClick={() => setTab("dashboard")}
@@ -950,23 +1079,41 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="flex items-center gap-2.5">
-                {selectedDetail.game.status !== "archived" && selectedDetail.game.exe_path && (
-                  <button
-                    onClick={() => handleLaunchExe(selectedDetail.game.exe_path)}
-                    className="flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
-                  >
-                    <Play className="h-4 w-4" />
-                    Play Game
-                  </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => handlePlayGame(selectedDetail.game)}
+                  className="flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
+                >
+                  <Play className="h-4 w-4" />
+                  {selectedDetail.game.mode === "ultra_auto_launch" ? "Auto-Play Game" : "Play Game"}
+                </button>
+                {selectedDetail.game.mode !== "ultra_auto_launch" && (
+                  <>
+                    <button
+                      onClick={() => handleRecompress(selectedDetail.game, true)}
+                      disabled={isRunning}
+                      className="flex items-center gap-2 rounded-xl bg-cyan-500/20 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/30 disabled:opacity-40"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      Re-Compress New Files
+                    </button>
+                    <button
+                      onClick={() => handleRecompress(selectedDetail.game, false, "brute_max")}
+                      disabled={isRunning}
+                      className="flex items-center gap-2 rounded-xl bg-slate-800 px-3.5 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700 disabled:opacity-40"
+                    >
+                      <Sparkles className="h-3.5 w-3.5 text-cyan-400" />
+                      Full Re-Compress (Extreme)
+                    </button>
+                  </>
                 )}
                 <button
                   onClick={() => handleRestore(selectedDetail.game)}
                   disabled={isRunning}
-                  className="flex items-center gap-2 rounded-xl bg-indigo-500/20 px-4 py-2 text-sm font-semibold text-indigo-200 hover:bg-indigo-500/30 disabled:opacity-40"
+                  className="flex items-center gap-2 rounded-xl bg-slate-800 px-3.5 py-2 text-xs font-semibold text-amber-200 hover:bg-amber-500/20 disabled:opacity-40"
                 >
-                  <RotateCcw className="h-4 w-4" />
-                  {selectedDetail.game.status === "archived" ? "Unpack to Play" : "Restore Original Files"}
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  Restore Original
                 </button>
               </div>
             </div>
@@ -992,18 +1139,22 @@ export default function App() {
               </div>
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
                 <p className="text-xs text-slate-400">Savings Breakdown</p>
-                <p className="mt-1 text-xs font-semibold text-white">
-                  Compressed: {formatBytes(selectedDetail.game.lzx_saved_bytes)}
-                </p>
+                {selectedDetail.game.lzx_saved_bytes > 0 && (
+                  <p className="mt-1 text-xs font-semibold text-white">
+                    LZX: {formatBytes(selectedDetail.game.lzx_saved_bytes)}
+                  </p>
+                )}
+                {selectedDetail.game.vault_saved_bytes > 0 && (
+                  <p className="mt-1 text-xs font-semibold text-indigo-300">
+                    Ultra Pack: {formatBytes(selectedDetail.game.vault_saved_bytes)}
+                  </p>
+                )}
                 <p className="text-xs text-amber-300">
                   Duplicates: {formatBytes(selectedDetail.game.dedup_saved_bytes)}
                 </p>
-                <p className="text-xs text-indigo-300">
-                  Deep Freeze: {formatBytes(selectedDetail.game.vault_saved_bytes)}
-                </p>
               </div>
               <div className="rounded-2xl border border-slate-800/80 bg-[#0b101b] p-4">
-                <p className="text-xs text-slate-400">Time Taken</p>
+                <p className="text-xs text-slate-400">Last Run</p>
                 <p className="mt-1 text-sm font-semibold text-white">
                   {selectedDetail.game.duration_secs.toFixed(1)}s
                 </p>
@@ -1060,9 +1211,9 @@ export default function App() {
                   </div>
                   {[
                     { id: "ALL", label: "All" },
-                    { id: "COMPRESSED", label: "Compressed" },
+                    { id: "ULTRA", label: "Ultra Pack" },
+                    { id: "COMPRESSED", label: "LZX" },
                     { id: "Duplicate Merged", label: "Duplicates" },
-                    { id: "DEEP", label: "Deep Freeze" },
                     { id: "Already Compressed", label: "Skipped" },
                   ].map((f) => (
                     <button
@@ -1108,13 +1259,15 @@ export default function App() {
                         <td className="px-3 py-2">
                           <span
                             className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
-                              a.action === "Max Compressed" || a.action === "Fast Compressed"
-                                ? "bg-emerald-500/15 text-emerald-300"
-                                : a.action === "Duplicate Merged"
-                                  ? "bg-amber-500/15 text-amber-300"
-                                  : a.action.startsWith("Deep Freeze") || a.action === "Archived Language"
-                                    ? "bg-indigo-500/20 text-indigo-300"
-                                    : "bg-slate-800 text-slate-400"
+                              a.action.startsWith("Ultra")
+                                ? "bg-indigo-500/20 text-indigo-300"
+                                : a.action === "Max Compressed" || a.action === "Fast Compressed"
+                                  ? "bg-emerald-500/15 text-emerald-300"
+                                  : a.action === "Duplicate Merged"
+                                    ? "bg-amber-500/15 text-amber-300"
+                                    : a.action === "Proxy Launcher"
+                                      ? "bg-cyan-500/20 text-cyan-300"
+                                      : "bg-slate-800 text-slate-400"
                             }`}
                           >
                             {a.action}

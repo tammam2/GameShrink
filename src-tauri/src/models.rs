@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionMode {
-    /// Playable Max: Strongest Windows compression (LZX) + skips already-compressed files. Runs directly from .exe.
+    /// Playable Max: Strongest native Windows compression (LZX) + skips already-compressed files.
     MaxCrush,
-    /// Playable Extreme: Forces strongest Windows compression (LZX) on every file. Runs directly from .exe.
+    /// Playable Extreme: Forces strongest Windows compression (LZX) on every single file.
     BruteMax,
     /// Playable Balanced: Fast load times for open-world games (LZX on static + XPRESS8K on streaming).
     AdaptiveThermal,
-    /// Deep Freeze: Smallest possible size for games you aren't playing right now. 1-click Unpack to Play.
-    HyperArchive,
+    /// Ultra Pack (Auto-Launch): Custom Smart-Delta + Texture-Planar + Auto-Transform + Zstd-19 with auto-unpacking .exe proxy & Instant Re-Seal on exit!
+    UltraAutoLaunch,
 }
 
 impl CompressionMode {
@@ -19,7 +19,16 @@ impl CompressionMode {
             CompressionMode::MaxCrush => "max_crush",
             CompressionMode::BruteMax => "brute_max",
             CompressionMode::AdaptiveThermal => "adaptive_thermal",
-            CompressionMode::HyperArchive => "hyper_archive",
+            CompressionMode::UltraAutoLaunch => "ultra_auto_launch",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "brute_max" => CompressionMode::BruteMax,
+            "adaptive_thermal" => CompressionMode::AdaptiveThermal,
+            "ultra_auto_launch" => CompressionMode::UltraAutoLaunch,
+            _ => CompressionMode::MaxCrush,
         }
     }
 }
@@ -30,7 +39,8 @@ pub struct CompressRequest {
     pub name: Option<String>,
     pub mode: CompressionMode,
     pub enable_hardlink_dedup: bool,
-    pub enable_cold_vault: bool,
+    pub clean_redist_bloat: bool,
+    pub only_uncompressed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +80,9 @@ pub struct FileAuditRecord {
     pub saved_bytes: u64,
     pub action: String,
     pub entropy: f64,
+    /// Stores BLAKE3 hash for Hardlinked files, or saved Transform Recipe for Ultra Pack files!
     pub blake3_hash: Option<String>,
+    /// Stores canonical target for Hardlinked files, or Reference I-Asset path for Smart Delta files!
     pub hardlink_target: Option<String>,
     pub vault_path: Option<String>,
 }
@@ -108,11 +120,10 @@ pub struct ScanPreview {
     pub current_disk_bytes: u64,
     pub duplicate_files: u64,
     pub duplicate_reclaimable_bytes: u64,
-    pub chrono_delta_pairs: u64,
+    pub bloat_files: u64,
+    pub bloat_bytes: u64,
     pub compressible_bytes: u64,
     pub high_entropy_bytes: u64,
-    pub cold_vault_candidates: u64,
-    pub cold_vault_bytes: u64,
     pub estimated_after_bytes: u64,
     pub estimated_saved_bytes: u64,
     pub categories: Vec<CategoryBreakdown>,
@@ -122,7 +133,6 @@ pub struct ScanPreview {
 pub struct ModeEstimate {
     pub mode: String,
     pub label: String,
-    pub playable_directly: bool,
     pub estimated_after_bytes: u64,
     pub estimated_saved_bytes: u64,
     pub estimated_saved_pct: f64,
@@ -133,6 +143,7 @@ pub struct BenchmarkReport {
     pub sample_count: u64,
     pub total_game_bytes: u64,
     pub duplicate_saved_bytes: u64,
+    pub bloat_saved_bytes: u64,
     pub estimates: Vec<ModeEstimate>,
 }
 
@@ -165,4 +176,19 @@ pub struct ProgressEvent {
     pub total_files: u64,
     pub saved_so_far_bytes: u64,
     pub pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatcherStatus {
+    pub enabled: bool,
+    pub auto_recompress: bool,
+    pub pending_updates: Vec<GameUpdateNotice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameUpdateNotice {
+    pub game_id: String,
+    pub game_name: String,
+    pub uncompressed_files: u64,
+    pub uncompressed_bytes: u64,
 }

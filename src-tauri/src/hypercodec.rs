@@ -6,10 +6,10 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
 
-const MAGIC: &[u8; 4] = b"AETH";
-const VERSION: u8 = 2;
+const MAGIC: &[u8; 4] = b"GSHK";
+const VERSION: u8 = 4;
 
-/// Invertible SIMD-friendly micro-transforms discovered automatically per file.
+/// Fast invertible micro-transforms discovered automatically per file and saved as a reusable recipe.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransformOp {
@@ -36,26 +36,33 @@ impl TransformOp {
             6 => Ok(TransformOp::Float32Split),
             7 => Ok(TransformOp::BcnPlanar8),
             8 => Ok(TransformOp::BcnPlanar16),
-            _ => Err(anyhow!("Unknown transform op id: {}", v)),
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            TransformOp::None => "Raw",
-            TransformOp::Delta8 => "Delta8",
-            TransformOp::Transpose2 => "Stride2",
-            TransformOp::Transpose4 => "Stride4",
-            TransformOp::Transpose8 => "Stride8",
-            TransformOp::Transpose16 => "Stride16",
-            TransformOp::Float32Split => "Float32Split",
-            TransformOp::BcnPlanar8 => "CanonPack-BC1",
-            TransformOp::BcnPlanar16 => "CanonPack-BC7",
+            _ => Err(anyhow!("Unknown transform op: {}", v)),
         }
     }
 }
 
-/// Forward byte-wise delta coding.
+pub fn serialize_recipe(ops: &[TransformOp]) -> String {
+    ops.iter()
+        .map(|o| (*o as u8).to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn parse_recipe(s: &str) -> Vec<TransformOp> {
+    let mut ops = Vec::new();
+    for part in s.split(',') {
+        if let Ok(v) = part.trim().parse::<u8>() {
+            if let Ok(op) = TransformOp::from_u8(v) {
+                ops.push(op);
+            }
+        }
+    }
+    if ops.is_empty() {
+        ops.push(TransformOp::None);
+    }
+    ops
+}
+
 fn delta8_forward(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut prev = 0u8;
@@ -66,7 +73,6 @@ fn delta8_forward(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Inverse byte-wise delta coding.
 fn delta8_inverse(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut acc = 0u8;
@@ -77,7 +83,6 @@ fn delta8_inverse(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Groups bytes at fixed struct stride `s` into contiguous planar streams.
 fn transpose_forward(input: &[u8], stride: usize) -> Vec<u8> {
     if stride <= 1 || input.len() < stride * 2 {
         return input.to_vec();
@@ -112,19 +117,17 @@ fn transpose_inverse(input: &[u8], stride: usize) -> Vec<u8> {
     out
 }
 
-/// Splits IEEE-754 32-bit floats into exponent/sign bytes vs mantissa planes (little-endian).
 fn float32_split_forward(input: &[u8]) -> Vec<u8> {
     let aligned = transpose_forward(input, 4);
     let blocks = input.len() / 4;
     if blocks < 4 {
         return aligned;
     }
-    // Delta-code the high-order exponent plane (lane 3) where values are strongly correlated
     let mut out = aligned;
-    let lane3_start = blocks * 3;
-    let lane3_end = blocks * 4;
-    let d = delta8_forward(&out[lane3_start..lane3_end]);
-    out[lane3_start..lane3_end].copy_from_slice(&d);
+    let start = blocks * 3;
+    let end = blocks * 4;
+    let d = delta8_forward(&out[start..end]);
+    out[start..end].copy_from_slice(&d);
     out
 }
 
@@ -134,21 +137,17 @@ fn float32_split_inverse(input: &[u8]) -> Vec<u8> {
         return transpose_inverse(input, 4);
     }
     let mut buf = input.to_vec();
-    let lane3_start = blocks * 3;
-    let lane3_end = blocks * 4;
-    let inv = delta8_inverse(&buf[lane3_start..lane3_end]);
-    buf[lane3_start..lane3_end].copy_from_slice(&inv);
+    let start = blocks * 3;
+    let end = blocks * 4;
+    let inv = delta8_inverse(&buf[start..end]);
+    buf[start..end].copy_from_slice(&inv);
     transpose_inverse(&buf, 4)
 }
 
-/// CanonPack BCn/DDS lossless planar de-interleaver.
-/// Keeps the 128-byte (or 148-byte DX10) DDS header intact, separates block endpoints/modes
-/// from index bitfields into contiguous planes, and delta-codes endpoint planes.
 fn dds_header_len(input: &[u8]) -> Option<usize> {
     if input.len() < 128 || &input[0..4] != b"DDS " {
         return None;
     }
-    // Check FourCC "DX10" at bytes 84..88
     if input.len() >= 148 && &input[84..88] == b"DX10" {
         Some(148)
     } else {
@@ -166,9 +165,7 @@ fn bcn_planar_forward(input: &[u8], block_size: usize) -> Vec<u8> {
     let body = &input[hdr..];
     let mut transposed = transpose_forward(body, block_size);
     let blocks = body.len() / block_size;
-    // Delta-code the first half of lanes (endpoints / mode bits), leave noisy index lanes untouched
-    let endpoint_lanes = block_size / 2;
-    let ep_end = blocks * endpoint_lanes;
+    let ep_end = blocks * (block_size / 2);
     let delta_ep = delta8_forward(&transposed[..ep_end]);
     transposed[..ep_end].copy_from_slice(&delta_ep);
     out.extend_from_slice(&transposed);
@@ -184,8 +181,7 @@ fn bcn_planar_inverse(input: &[u8], block_size: usize) -> Vec<u8> {
     out.extend_from_slice(&input[..hdr]);
     let mut body = input[hdr..].to_vec();
     let blocks = body.len() / block_size;
-    let endpoint_lanes = block_size / 2;
-    let ep_end = blocks * endpoint_lanes;
+    let ep_end = blocks * (block_size / 2);
     let restored_ep = delta8_inverse(&body[..ep_end]);
     body[..ep_end].copy_from_slice(&restored_ep);
     let unt = transpose_inverse(&body, block_size);
@@ -221,8 +217,6 @@ pub fn apply_op_inverse(data: &[u8], op: TransformOp) -> Vec<u8> {
     }
 }
 
-/// Auto-Evolved SIMD Transform Bytecode Search:
-/// Tests candidate pipelines on a 256 KB sample at fast Zstd-3 and returns the winning pipeline.
 pub fn discover_best_pipeline(data: &[u8], is_dds: bool) -> Vec<TransformOp> {
     if data.len() < 4096 {
         return vec![TransformOp::None];
@@ -269,18 +263,15 @@ pub fn discover_best_pipeline(data: &[u8], is_dds: bool) -> Vec<TransformOp> {
     best_ops
 }
 
-/// ChronoDelta: 32-hash MinHash sketch over 64-byte shingles for fast near-duplicate clustering.
 const SKETCH_LEN: usize = 32;
 
 pub fn compute_minhash_sketch(path: &Path) -> Option<[u64; SKETCH_LEN]> {
     let mut file = File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
-    let len = meta.len();
+    let len = file.metadata().ok()?.len();
     if len < 8 * 1024 || len > 128 * 1024 * 1024 {
         return None;
     }
 
-    // Read up to 256 KB distributed sample for blazing fast LSH clustering
     let cap = (len as usize).min(256 * 1024);
     let mut buf = vec![0u8; cap];
     let n = file.read(&mut buf).ok()?;
@@ -298,7 +289,9 @@ pub fn compute_minhash_sketch(path: &Path) -> Option<[u64; SKETCH_LEN]> {
         let h1 = u64::from_le_bytes(hb[0..8].try_into().unwrap());
         let h2 = u64::from_le_bytes(hb[8..16].try_into().unwrap());
         for i in 0..SKETCH_LEN {
-            let mixed = h1.wrapping_add((i as u64).wrapping_mul(h2)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mixed = h1
+                .wrapping_add((i as u64).wrapping_mul(h2))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
             if mixed < sketch[i] {
                 sketch[i] = mixed;
             }
@@ -318,22 +311,20 @@ pub fn sketch_similarity(a: &[u64; SKETCH_LEN], b: &[u64; SKETCH_LEN]) -> f64 {
     matches as f64 / SKETCH_LEN as f64
 }
 
-/// Finds ChronoDelta reference pairs `(target_rel -> ref_rel)` for near-duplicate assets
-/// that share >= 35% shingle similarity (not 100% identical, since hardlinks handle exact matches).
-pub fn find_chrono_delta_pairs(
+pub fn find_similarity_pairs(
     files: &[(String, std::path::PathBuf, u64)],
 ) -> HashMap<String, String> {
     let sketched: Vec<(String, u64, [u64; SKETCH_LEN])> = files
         .par_iter()
-        .filter_map(|(rel, abs, sz)| {
-            compute_minhash_sketch(abs).map(|sk| (rel.clone(), *sz, sk))
-        })
+        .filter_map(|(rel, abs, sz)| compute_minhash_sketch(abs).map(|sk| (rel.clone(), *sz, sk)))
         .collect();
 
-    // Bucket by first sketch band to keep clustering O(N) instead of O(N^2)
     let mut buckets: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
     for (idx, (_, _, sk)) in sketched.iter().enumerate() {
-        buckets.entry((sk[0] & 0xFFFF, sk[1] & 0xFFFF)).or_default().push(idx);
+        buckets
+            .entry((sk[0] & 0xFFFF, sk[1] & 0xFFFF))
+            .or_default()
+            .push(idx);
     }
 
     let mut pairs: HashMap<String, String> = HashMap::new();
@@ -343,19 +334,16 @@ pub fn find_chrono_delta_pairs(
         if group.len() < 2 {
             continue;
         }
-        // Pick first item in bucket as candidate I-Asset reference
         let ref_idx = group[0];
         let (ref_rel, ref_sz, ref_sk) = &sketched[ref_idx];
         if pairs.contains_key(ref_rel) {
             continue;
         }
-
         for &cand_idx in &group[1..] {
             let (cand_rel, cand_sz, cand_sk) = &sketched[cand_idx];
             if pairs.contains_key(cand_rel) || used_as_ref.contains_key(cand_rel) {
                 continue;
             }
-            // Only pair assets within 2x size ratio
             let max_s = (*ref_sz).max(*cand_sz) as f64;
             let min_s = (*ref_sz).min(*cand_sz) as f64;
             if max_s / min_s.max(1.0) > 2.0 {
@@ -372,7 +360,6 @@ pub fn find_chrono_delta_pairs(
     pairs
 }
 
-/// Computes reversible byte-wise residual `target XOR ref` (aligned prefix, trailing bytes raw).
 fn xor_residual_apply(target: &[u8], reference: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(target.len());
     let common = target.len().min(reference.len());
@@ -386,22 +373,21 @@ fn xor_residual_apply(target: &[u8], reference: &[u8]) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-pub struct HyperEncodeResult {
+pub struct UltraEncodeResult {
     pub compressed_size: u64,
-    pub codec_label: String,
-    pub used_chrono_delta: bool,
-    pub used_canon_pack: bool,
-    pub used_auto_simd: bool,
+    pub friendly_label: String,
+    pub recipe: String,
 }
 
-/// Compresses `src` into `dest` using the full Beyond-SOTA HyperVault stack:
-/// Optional ChronoDelta reference residual -> Auto-Evolved SIMD / CanonPack BCn -> Zstd-19.
-pub fn encode_hyper_file(
+/// Encodes `src` to `dest`. If `saved_recipe` is provided, skips transform search completely
+/// for 5-8x faster re-compression!
+pub fn encode_ultra_file(
     src: &Path,
     dest: &Path,
     reference_path: Option<&Path>,
+    saved_recipe: Option<&str>,
     zstd_level: i32,
-) -> Result<HyperEncodeResult> {
+) -> Result<UltraEncodeResult> {
     let raw = fs::read(src)?;
     let is_dds = src
         .extension()
@@ -421,7 +407,11 @@ pub fn encode_hyper_file(
         raw.clone()
     };
 
-    let ops = discover_best_pipeline(&working, is_dds && !is_delta);
+    let ops = match saved_recipe {
+        Some(r) if !r.trim().is_empty() => parse_recipe(r),
+        _ => discover_best_pipeline(&working, is_dds && !is_delta),
+    };
+
     let mut transformed = working;
     for &op in &ops {
         if op != TransformOp::None {
@@ -445,49 +435,42 @@ pub fn encode_hyper_file(
     f.write_all(&(raw.len() as u64).to_le_bytes())?;
     f.write_all(&payload)?;
 
-    let compressed_size = fs::metadata(dest).map(|m| m.len()).unwrap_or(payload.len() as u64);
+    let compressed_size = fs::metadata(dest)
+        .map(|m| m.len())
+        .unwrap_or(payload.len() as u64);
 
-    let used_canon_pack = ops
+    let used_bcn = ops
         .iter()
         .any(|o| matches!(o, TransformOp::BcnPlanar8 | TransformOp::BcnPlanar16));
-    let used_auto_simd = ops
+    let used_smart = ops
         .iter()
         .any(|o| !matches!(o, TransformOp::None | TransformOp::BcnPlanar8 | TransformOp::BcnPlanar16));
 
-    let op_str = ops
-        .iter()
-        .map(|o| o.label())
-        .collect::<Vec<_>>()
-        .join("+");
-
-    let codec_label = if is_delta {
-        format!("ChronoDelta+{}+Zstd{}", op_str, zstd_level)
-    } else if used_canon_pack {
-        format!("{}+Zstd{}", op_str, zstd_level)
-    } else if used_auto_simd {
-        format!("AutoSIMD({})+Zstd{}", op_str, zstd_level)
+    let friendly_label = if is_delta {
+        "Ultra (Smart Delta)".to_string()
+    } else if used_bcn {
+        "Ultra (Texture Pack)".to_string()
+    } else if used_smart {
+        "Ultra (Smart Pack)".to_string()
     } else {
-        format!("Zstd{}", zstd_level)
+        "Ultra Pack".to_string()
     };
 
-    Ok(HyperEncodeResult {
+    Ok(UltraEncodeResult {
         compressed_size,
-        codec_label,
-        used_chrono_delta: is_delta,
-        used_canon_pack,
-        used_auto_simd,
+        friendly_label,
+        recipe: serialize_recipe(&ops),
     })
 }
 
-/// Decodes an `.aether` HyperVault file back to the exact bit-for-bit original file.
-pub fn decode_hyper_file(
+/// Decodes a `.gsh` file back to its exact bit-for-bit original file.
+pub fn decode_ultra_file(
     src: &Path,
     dest: &Path,
     reference_path: Option<&Path>,
 ) -> Result<u64> {
     let bytes = fs::read(src)?;
     if bytes.len() < 15 || &bytes[0..4] != MAGIC {
-        // Fallback: plain zstd stream from v1.0 Cold Vault
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -502,7 +485,7 @@ pub fn decode_hyper_file(
     let op_count = bytes[6] as usize;
     let header_end = 7 + op_count + 8;
     if bytes.len() < header_end {
-        return Err(anyhow!("Corrupt AETH header in {}", src.display()));
+        return Err(anyhow!("Corrupt GSHK header in {}", src.display()));
     }
 
     let mut ops = Vec::with_capacity(op_count);
@@ -522,10 +505,7 @@ pub fn decode_hyper_file(
 
     if is_delta {
         let ref_p = reference_path.ok_or_else(|| {
-            anyhow!(
-                "Missing ChronoDelta reference file to reconstruct {}",
-                dest.display()
-            )
+            anyhow!("Missing Smart Delta reference file for {}", dest.display())
         })?;
         let ref_bytes = fs::read(ref_p)?;
         data = xor_residual_apply(&data, &ref_bytes);

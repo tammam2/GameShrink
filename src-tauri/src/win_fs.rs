@@ -14,16 +14,8 @@ impl WofAlgo {
             WofAlgo::Xpress8k => "/EXE:XPRESS8K",
         }
     }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            WofAlgo::Lzx => "LZX",
-            WofAlgo::Xpress8k => "XPRESS8K",
-        }
-    }
 }
 
-/// Returns the true physical bytes occupied on disk (NTFS compressed size on Windows).
 pub fn get_disk_size(path: &Path) -> u64 {
     #[cfg(target_os = "windows")]
     {
@@ -49,14 +41,32 @@ pub fn get_disk_size(path: &Path) -> u64 {
     }
 }
 
-/// Atomically replaces `duplicate_path` with an NTFS hardlink pointing to `canonical_path`.
-/// Uses a temporary backup rename so a failure can never lose file data.
+pub fn set_hidden(path: &Path, hidden: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let flag = if hidden { "+H" } else { "-H" };
+        let _ = Command::new("attrib")
+            .arg(flag)
+            .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (path, hidden);
+    }
+}
+
 pub fn replace_with_hardlink(duplicate_path: &Path, canonical_path: &Path) -> Result<()> {
     if duplicate_path == canonical_path {
         return Ok(());
     }
 
-    let backup_path = duplicate_path.with_extension("aethercrush_hl_bak");
+    let backup_path = duplicate_path.with_extension("gameshrink_hl_bak");
     std::fs::rename(duplicate_path, &backup_path)?;
 
     match std::fs::hard_link(canonical_path, duplicate_path) {
@@ -71,15 +81,13 @@ pub fn replace_with_hardlink(duplicate_path: &Path, canonical_path: &Path) -> Re
     }
 }
 
-/// Breaks an NTFS hardlink by cloning the file data to a fresh independent inode.
 pub fn break_hardlink(path: &Path) -> Result<()> {
-    let tmp = path.with_extension("aethercrush_unhl_tmp");
+    let tmp = path.with_extension("gameshrink_unhl_tmp");
     std::fs::copy(path, &tmp)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// Applies Windows NTFS WOF compression (`LZX` or `XPRESS8K`) transparently so `game.exe` runs directly.
 pub fn compress_file_wof(path: &Path, algo: WofAlgo) -> Result<u64> {
     #[cfg(target_os = "windows")]
     {
@@ -110,7 +118,6 @@ pub fn compress_file_wof(path: &Path, algo: WofAlgo) -> Result<u64> {
     }
 }
 
-/// Decompresses a WOF-compressed file back to raw uncompressed NTFS storage.
 pub fn decompress_file_wof(path: &Path) -> Result<u64> {
     #[cfg(target_os = "windows")]
     {

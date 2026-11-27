@@ -1,7 +1,8 @@
 [package]
 name = "gameshrink"
-version = "2.1.0"
-description = "Smart Game Compressor for Windows — shrink games while keeping them playable directly from their .exe"
+version = "4.0.0"
+default-run = "gameshrink"
+description = "Smart Game Compressor with Ultra Pack Auto-Launch Proxy, Instant Re-Seal, NTFS LZX & Live Update Watcher"
 authors = ["GameShrink"]
 edition = "2021"
 rust-version = "1.77"
@@ -9,6 +10,14 @@ rust-version = "1.77"
 [lib]
 name = "gameshrink_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "gameshrink"
+path = "src/main.rs"
+
+[[bin]]
+name = "gs_shim"
+path = "src/shim_main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

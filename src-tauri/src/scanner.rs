@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub const VAULT_DIR_NAME: &str = ".gameshrink_vault";
+pub const SHIM_CONFIG_NAME: &str = ".gameshrink_shim.json";
 pub const HIGH_ENTROPY_THRESHOLD: f64 = 7.82;
 pub const MIN_COMPRESS_BYTES: u64 = 8 * 1024;
 
@@ -23,10 +24,9 @@ pub struct ScannedFile {
     pub entropy: f64,
     pub is_writable_config: bool,
     pub is_streaming_archive: bool,
-    pub is_cold_vault_candidate: bool,
+    pub is_bloat_redist: bool,
 }
 
-/// Fast 3-window randomness sampler (start, middle, end — 16 KB each).
 pub fn sample_entropy(path: &Path, file_size: u64) -> f64 {
     if file_size == 0 {
         return 0.0;
@@ -139,30 +139,17 @@ pub fn is_streaming_archive(rel_path: &str) -> bool {
     )
 }
 
-pub fn is_cold_vault_candidate(rel_path: &str, size: u64) -> bool {
-    if size < 5 * 1024 * 1024 {
-        return false;
-    }
+pub fn is_bloat_redist(rel_path: &str) -> bool {
     let lower = rel_path.to_lowercase();
-    let is_media_or_pack = lower.ends_with(".bnk")
-        || lower.ends_with(".pck")
-        || lower.ends_with(".wem")
-        || lower.ends_with(".fsb")
-        || lower.ends_with(".bik")
-        || lower.ends_with(".bk2")
-        || lower.ends_with(".usm")
-        || lower.ends_with(".pak");
-
-    if !is_media_or_pack {
-        return false;
-    }
-
-    let foreign_markers = [
-        "french", "german", "spanish", "russian", "japanese", "chinese", "korean", "italian",
-        "polish", "portuguese", "brazilian", "_fr_", "_de_", "_es_", "_ru_", "_jp_", "_ja_",
-        "_zh_", "_ko_", "_it_", "_pl_", "_pt_", "(fr)", "(de)", "(es)", "(ru)", "(jp)",
-    ];
-    foreign_markers.iter().any(|m| lower.contains(m))
+    lower.contains("_commonredist/")
+        || lower.contains("redist/")
+        || lower.contains("directx/")
+        || lower.contains("vcredist")
+        || lower.contains("ue4prereqsetup")
+        || lower.contains("ueprereqsetup")
+        || lower.ends_with(".pdb")
+        || lower.ends_with(".dmp")
+        || lower.ends_with(".mdmp")
 }
 
 pub fn detect_anti_cheat(files: &[ScannedFile]) -> (bool, Option<String>) {
@@ -240,7 +227,7 @@ pub fn collect_game_files(root: &Path) -> Result<Vec<ScannedFile>> {
         .filter_entry(|e| {
             e.file_name()
                 .to_str()
-                .map(|n| n != VAULT_DIR_NAME && n != ".aethercrush_vault")
+                .map(|n| n != VAULT_DIR_NAME && n != SHIM_CONFIG_NAME && !n.ends_with(".gs_orig"))
                 .unwrap_or(true)
         })
         .filter_map(|e| e.ok())
@@ -274,12 +261,50 @@ pub fn collect_game_files(root: &Path) -> Result<Vec<ScannedFile>> {
                 entropy,
                 is_writable_config: is_writable_config(&rel_path),
                 is_streaming_archive: is_streaming_archive(&rel_path),
-                is_cold_vault_candidate: is_cold_vault_candidate(&rel_path, logical_bytes),
+                is_bloat_redist: is_bloat_redist(&rel_path),
             })
         })
         .collect();
 
     Ok(scanned)
+}
+
+pub fn count_uncompressed_updates(root: &Path) -> (u64, u64) {
+    if !root.exists() || !root.is_dir() {
+        return (0, 0);
+    }
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n != VAULT_DIR_NAME && n != SHIM_CONFIG_NAME && !n.ends_with(".gs_orig"))
+                .unwrap_or(true)
+        })
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(meta) = fs::metadata(path) {
+            let logical = meta.len();
+            if logical < 1024 * 1024 {
+                continue;
+            }
+            let disk = win_fs::get_disk_size(path);
+            if disk >= logical {
+                let ent = sample_entropy(path, logical);
+                if ent <= HIGH_ENTROPY_THRESHOLD {
+                    count += 1;
+                    bytes += logical;
+                }
+            }
+        }
+    }
+    (count, bytes)
 }
 
 pub fn find_intra_game_duplicates(files: &[ScannedFile]) -> HashMap<String, (String, String)> {
@@ -324,18 +349,6 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
     let detected_exe = detect_main_exe(&root, &files);
     let duplicates = find_intra_game_duplicates(&files);
 
-    let chrono_candidates: Vec<(String, PathBuf, u64)> = files
-        .iter()
-        .filter(|f| {
-            !duplicates.contains_key(&f.rel_path)
-                && f.logical_bytes >= 32 * 1024
-                && f.logical_bytes <= 64 * 1024 * 1024
-        })
-        .take(1500)
-        .map(|f| (f.rel_path.clone(), f.abs_path.clone(), f.logical_bytes))
-        .collect();
-    let chrono_pairs = hypercodec::find_chrono_delta_pairs(&chrono_candidates);
-
     let suggested_name = root
         .file_name()
         .and_then(|n| n.to_str())
@@ -345,10 +358,10 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
     let mut total_logical_bytes = 0u64;
     let mut current_disk_bytes = 0u64;
     let mut duplicate_reclaimable_bytes = 0u64;
+    let mut bloat_files = 0u64;
+    let mut bloat_bytes = 0u64;
     let mut compressible_bytes = 0u64;
     let mut high_entropy_bytes = 0u64;
-    let mut cold_vault_candidates = 0u64;
-    let mut cold_vault_bytes = 0u64;
     let mut estimated_saved_bytes = 0u64;
 
     let mut cat_map: HashMap<String, CategoryBreakdown> = HashMap::new();
@@ -356,6 +369,11 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
     for f in &files {
         total_logical_bytes += f.logical_bytes;
         current_disk_bytes += f.disk_bytes;
+
+        if f.is_bloat_redist {
+            bloat_files += 1;
+            bloat_bytes += f.disk_bytes;
+        }
 
         let is_dup = duplicates.contains_key(&f.rel_path);
         let mut est_file_saved = 0u64;
@@ -370,11 +388,6 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
             compressible_bytes += f.disk_bytes;
             let est_ratio = ((8.0 - f.entropy) / 8.0).clamp(0.08, 0.72);
             est_file_saved = (f.disk_bytes as f64 * est_ratio) as u64;
-        }
-
-        if f.is_cold_vault_candidate {
-            cold_vault_candidates += 1;
-            cold_vault_bytes += f.disk_bytes;
         }
 
         estimated_saved_bytes += est_file_saved;
@@ -410,19 +423,16 @@ pub fn scan_game_preview(path_str: &str) -> Result<ScanPreview> {
         current_disk_bytes,
         duplicate_files: duplicates.len() as u64,
         duplicate_reclaimable_bytes,
-        chrono_delta_pairs: chrono_pairs.len() as u64,
+        bloat_files,
+        bloat_bytes,
         compressible_bytes,
         high_entropy_bytes,
-        cold_vault_candidates,
-        cold_vault_bytes,
         estimated_after_bytes,
         estimated_saved_bytes,
         categories,
     })
 }
 
-/// Benchmarks real sample files from the game folder and projects exact space savings
-/// for every compression option so the user knows what each option will save before starting.
 pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
     let root = PathBuf::from(path_str);
     let files = collect_game_files(&root)?;
@@ -432,6 +442,11 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
     let duplicate_saved_bytes: u64 = files
         .iter()
         .filter(|f| duplicates.contains_key(&f.rel_path))
+        .map(|f| f.disk_bytes)
+        .sum();
+    let bloat_saved_bytes: u64 = files
+        .iter()
+        .filter(|f| f.is_bloat_redist)
         .map(|f| f.disk_bytes)
         .sum();
 
@@ -457,19 +472,18 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
         .map(|f| f.disk_bytes)
         .sum();
 
-    // Sample up to 14 real files (mix of compressible + high-entropy + near-duplicates)
     let sample_pool: Vec<&ScannedFile> = non_dup
         .iter()
         .copied()
         .filter(|f| f.logical_bytes >= 64 * 1024 && f.logical_bytes <= 12 * 1024 * 1024)
         .collect();
 
-    let chrono_input: Vec<(String, PathBuf, u64)> = sample_pool
+    let sim_input: Vec<(String, PathBuf, u64)> = sample_pool
         .iter()
         .take(1000)
         .map(|f| (f.rel_path.clone(), f.abs_path.clone(), f.logical_bytes))
         .collect();
-    let chrono_pairs = hypercodec::find_chrono_delta_pairs(&chrono_input);
+    let sim_pairs = hypercodec::find_similarity_pairs(&sim_input);
 
     let mut picked: Vec<&ScannedFile> = Vec::new();
     for f in &sample_pool {
@@ -489,15 +503,15 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
         }
     }
 
-    let temp_dir = std::env::temp_dir().join("gameshrink_bench");
+    let temp_dir = std::env::temp_dir().join("gameshrink_bench_v4");
     let _ = fs::create_dir_all(&temp_dir);
 
     struct SampleMeasure {
         is_high_entropy: bool,
         raw: u64,
-        fast_out: u64,   // approximates XPRESS8K
-        strong_out: u64, // approximates LZX
-        deep_out: u64,   // real Deep Freeze HyperCodec
+        fast_out: u64,
+        strong_out: u64,
+        ultra_out: u64,
     }
 
     let measures: Vec<SampleMeasure> = picked
@@ -508,15 +522,16 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
             let fast_out = zstd::bulk::compress(&raw, 1).ok()?.len() as u64;
             let strong_out = zstd::bulk::compress(&raw, 9).ok()?.len() as u64;
 
-            let ref_abs = chrono_pairs.get(&f.rel_path).map(|r| root.join(r));
+            let ref_abs = sim_pairs.get(&f.rel_path).map(|r| root.join(r));
             let tmp_out = temp_dir.join(format!(
-                "{}.aether",
+                "{}.gsh",
                 blake3::hash(f.rel_path.as_bytes()).to_hex()
             ));
-            let deep_out = hypercodec::encode_hyper_file(
+            let ultra_out = hypercodec::encode_ultra_file(
                 &f.abs_path,
                 &tmp_out,
                 ref_abs.as_deref(),
+                None,
                 19,
             )
             .map(|r| r.compressed_size)
@@ -529,15 +544,14 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
                 raw: raw_len,
                 fast_out: fast_out.min(raw_len),
                 strong_out: strong_out.min(raw_len),
-                deep_out: deep_out.min(raw_len),
+                ultra_out: ultra_out.min(raw_len),
             })
         })
         .collect();
 
     let _ = fs::remove_dir_all(&temp_dir);
 
-    // Compute real measured savings ratios from sample files
-    let (comp_raw, comp_fast, comp_strong, comp_deep) = measures
+    let (comp_raw, comp_fast, comp_strong, comp_ultra) = measures
         .iter()
         .filter(|m| !m.is_high_entropy)
         .fold((0u64, 0u64, 0u64, 0u64), |acc, m| {
@@ -545,19 +559,17 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
                 acc.0 + m.raw,
                 acc.1 + m.fast_out,
                 acc.2 + m.strong_out,
-                acc.3 + m.deep_out,
+                acc.3 + m.ultra_out,
             )
         });
 
-    let (hi_raw, hi_strong, hi_deep) = measures
+    let (hi_raw, hi_strong, hi_ultra) = measures
         .iter()
         .filter(|m| m.is_high_entropy)
         .fold((0u64, 0u64, 0u64), |acc, m| {
-            (acc.0 + m.raw, acc.1 + m.strong_out, acc.2 + m.deep_out)
+            (acc.0 + m.raw, acc.1 + m.strong_out, acc.2 + m.ultra_out)
         });
 
-    // Real ratios (with sensible fallback if no files fell in a bucket)
-    // Note: NTFS LZX achieves ~92% of Zstd-9's savings; XPRESS8K achieves ~76% of Zstd-1's savings.
     let lzx_ratio_comp = if comp_raw > 0 {
         ((comp_raw.saturating_sub(comp_strong)) as f64 / comp_raw as f64) * 0.92
     } else {
@@ -568,10 +580,10 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
     } else {
         0.22
     };
-    let deep_ratio_comp = if comp_raw > 0 {
-        (comp_raw.saturating_sub(comp_deep)) as f64 / comp_raw as f64
+    let ultra_ratio_comp = if comp_raw > 0 {
+        (comp_raw.saturating_sub(comp_ultra)) as f64 / comp_raw as f64
     } else {
-        0.40
+        0.42
     };
 
     let lzx_ratio_hi = if hi_raw > 0 {
@@ -579,13 +591,13 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
     } else {
         0.02
     };
-    let deep_ratio_hi = if hi_raw > 0 {
-        (hi_raw.saturating_sub(hi_deep)) as f64 / hi_raw as f64
+    let ultra_ratio_hi = if hi_raw > 0 {
+        (hi_raw.saturating_sub(hi_ultra)) as f64 / hi_raw as f64
     } else {
-        0.04
+        0.05
     };
 
-    let make_est = |mode: &str, label: &str, playable: bool, saved: u64| {
+    let make_est = |mode: &str, label: &str, saved: u64| {
         let clamped_saved = saved.min(total_game_bytes);
         let after = total_game_bytes.saturating_sub(clamped_saved);
         let pct = if total_game_bytes > 0 {
@@ -596,7 +608,6 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
         ModeEstimate {
             mode: mode.to_string(),
             label: label.to_string(),
-            playable_directly: playable,
             estimated_after_bytes: after,
             estimated_saved_bytes: clamped_saved,
             estimated_saved_pct: pct,
@@ -613,21 +624,22 @@ pub fn estimate_all_modes(path_str: &str) -> Result<BenchmarkReport> {
         + (compressible_total as f64 * lzx_ratio_comp) as u64
         + (high_entropy_total as f64 * lzx_ratio_hi) as u64;
 
-    let saved_deep = duplicate_saved_bytes
-        + (compressible_total as f64 * deep_ratio_comp) as u64
-        + (high_entropy_total as f64 * deep_ratio_hi) as u64;
+    let saved_ultra = duplicate_saved_bytes
+        + (compressible_total as f64 * ultra_ratio_comp) as u64
+        + (high_entropy_total as f64 * ultra_ratio_hi) as u64;
 
     let estimates = vec![
-        make_est("adaptive_thermal", "Playable Balanced", true, saved_balanced),
-        make_est("max_crush", "Playable Max", true, saved_max),
-        make_est("brute_max", "Playable Extreme", true, saved_extreme),
-        make_est("hyper_archive", "Deep Freeze (Smallest Size)", false, saved_deep),
+        make_est("adaptive_thermal", "Playable Balanced", saved_balanced),
+        make_est("max_crush", "Playable Max", saved_max),
+        make_est("brute_max", "Playable Extreme", saved_extreme),
+        make_est("ultra_auto_launch", "Ultra Pack (Auto-Launch)", saved_ultra),
     ];
 
     Ok(BenchmarkReport {
         sample_count: measures.len() as u64,
         total_game_bytes,
         duplicate_saved_bytes,
+        bloat_saved_bytes,
         estimates,
     })
 }
