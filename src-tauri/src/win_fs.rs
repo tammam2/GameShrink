@@ -73,7 +73,9 @@ pub fn replace_with_hardlink(duplicate_path: &Path, canonical_path: &Path) -> Re
     }
 }
 
-fn create_hardlink_native(new_link: &Path, existing_target: &Path) -> Result<()> { std::fs::hard_link(existing_target, new_link)?; Ok(()) }`r`n`r`n/// Breaks an NTFS hardlink by cloning the file data to a fresh independent inode.
+fn create_hardlink_native(new_link: &Path, existing_target: &Path) -> Result<()> { std::fs::hard_link(existing_target, new_link)?; Ok(()) }
+
+/// Breaks an NTFS hardlink by cloning the file data to a fresh independent inode.
 pub fn break_hardlink(path: &Path) -> Result<()> {
     let tmp = path.with_extension("aethercrush_unhl_tmp");
     std::fs::copy(path, &tmp)?;
