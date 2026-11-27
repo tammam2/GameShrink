@@ -11,8 +11,16 @@ use models::{
 };
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
+
+struct CancelFlag(Arc<AtomicBool>);
+
+#[tauri::command]
+fn cancel_operation(cancel: State<'_, CancelFlag>) {
+    cancel.0.store(true, Ordering::Relaxed);
+}
 
 #[tauri::command]
 async fn scan_game_folder(path: String) -> Result<ScanPreview, String> {
@@ -23,8 +31,8 @@ async fn scan_game_folder(path: String) -> Result<ScanPreview, String> {
 }
 
 #[tauri::command]
-async fn benchmark_beyond_sota(path: String) -> Result<BenchmarkReport, String> {
-    tauri::async_runtime::spawn_blocking(move || scanner::benchmark_beyond_sota(&path))
+async fn estimate_all_modes(path: String) -> Result<BenchmarkReport, String> {
+    tauri::async_runtime::spawn_blocking(move || scanner::estimate_all_modes(&path))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
@@ -34,25 +42,33 @@ async fn benchmark_beyond_sota(path: String) -> Result<BenchmarkReport, String> 
 async fn compress_game(
     app: AppHandle,
     db: State<'_, Arc<LedgerDb>>,
+    cancel: State<'_, CancelFlag>,
     request: CompressRequest,
 ) -> Result<GameRecord, String> {
+    cancel.0.store(false, Ordering::Relaxed);
     let db_arc = Arc::clone(&db);
-    tauri::async_runtime::spawn_blocking(move || engine::run_compression(&app, &db_arc, request))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+    let cancel_arc = Arc::clone(&cancel.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::run_compression(&app, &db_arc, &cancel_arc, request)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn restore_game(
     app: AppHandle,
     db: State<'_, Arc<LedgerDb>>,
+    cancel: State<'_, CancelFlag>,
     game_id: String,
     break_hardlinks: bool,
 ) -> Result<GameRecord, String> {
+    cancel.0.store(false, Ordering::Relaxed);
     let db_arc = Arc::clone(&db);
+    let cancel_arc = Arc::clone(&cancel.0);
     tauri::async_runtime::spawn_blocking(move || {
-        engine::restore_game(&app, &db_arc, &game_id, break_hardlinks)
+        engine::restore_game(&app, &db_arc, &cancel_arc, &game_id, break_hardlinks)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -82,7 +98,6 @@ fn delete_game_record(db: State<'_, Arc<LedgerDb>>, game_id: String) -> Result<(
     db.delete_game_record(&game_id).map_err(|e| e.to_string())
 }
 
-/// Launches the game executable directly with its own working directory — zero wrapper overhead.
 #[tauri::command]
 fn launch_game_exe(exe_path: String) -> Result<(), String> {
     let path = PathBuf::from(&exe_path);
@@ -125,14 +140,16 @@ pub fn run() {
                 .path()
                 .app_local_data_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
-            let db_path = data_dir.join("aethercrush_ledger.db");
+            let db_path = data_dir.join("gameshrink_history.db");
             let ledger = Arc::new(LedgerDb::open(&db_path)?);
             app.manage(ledger);
+            app.manage(CancelFlag(Arc::new(AtomicBool::new(false))));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            cancel_operation,
             scan_game_folder,
-            benchmark_beyond_sota,
+            estimate_all_modes,
             compress_game,
             restore_game,
             list_games,
@@ -143,5 +160,5 @@ pub fn run() {
             open_folder,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running AetherCrush");
+        .expect("error while running GameShrink");
 }

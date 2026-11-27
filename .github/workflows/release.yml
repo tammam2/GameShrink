@@ -1,4 +1,4 @@
-name: Release AetherCrush (Windows)
+name: Release GameShrink (Windows)
 
 on:
   push:
@@ -32,7 +32,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
-          releaseName: "AetherCrush v__VERSION__"
-          releaseBody: "Windows NSIS (.exe) and MSI installers for AetherCrush."
+          releaseName: "GameShrink v__VERSION__"
+          releaseBody: "Windows NSIS (.exe) and MSI installers for GameShrink."
           releaseDraft: true
           prerelease: false

@@ -1,13 +1,13 @@
 [package]
-name = "aethercrush"
-version = "2.0.0"
-description = "Beyond-SOTA Game Compressor: NTFS LZX, Intra-Game Hardlinks, ChronoDelta LSH Residuals, CanonPack BCn & Auto-SIMD Bytecode"
-authors = ["AetherCrush"]
+name = "gameshrink"
+version = "2.1.0"
+description = "Smart Game Compressor for Windows — shrink games while keeping them playable directly from their .exe"
+authors = ["GameShrink"]
 edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "aethercrush_lib"
+name = "gameshrink_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

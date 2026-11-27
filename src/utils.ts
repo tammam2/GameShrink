@@ -9,15 +9,15 @@ export function formatBytes(bytes: number): string {
 export function formatModeLabel(mode: string): string {
   switch (mode) {
     case "max_crush":
-      return "MAX CRUSH (LZX)";
+      return "Playable Max";
     case "brute_max":
-      return "BRUTE MAX (ALL LZX)";
+      return "Playable Extreme";
     case "adaptive_thermal":
-      return "ADAPTIVE THERMAL";
+      return "Playable Balanced";
     case "hyper_archive":
-      return "HYPERARCHIVE (BEYOND-SOTA)";
+      return "Deep Freeze";
     default:
-      return mode.toUpperCase();
+      return mode;
   }
 }
 

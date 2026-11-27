@@ -92,23 +92,20 @@ export interface ScanPreview {
   categories: CategoryBreakdown[];
 }
 
-export interface BenchmarkSampleRow {
-  rel_path: string;
-  raw_bytes: number;
-  zstd19_bytes: number;
-  hyper_bytes: number;
-  winning_codec: string;
-  extra_gain_pct: number;
+export interface ModeEstimate {
+  mode: string;
+  label: string;
+  playable_directly: boolean;
+  estimated_after_bytes: number;
+  estimated_saved_bytes: number;
+  estimated_saved_pct: number;
 }
 
 export interface BenchmarkReport {
   sample_count: number;
-  total_raw_bytes: number;
-  total_zstd19_bytes: number;
-  total_hyper_bytes: number;
-  chrono_delta_pairs_found: number;
-  extra_saved_over_zstd_bytes: number;
-  rows: BenchmarkSampleRow[];
+  total_game_bytes: number;
+  duplicate_saved_bytes: number;
+  estimates: ModeEstimate[];
 }
 
 export interface GameDetailResponse {

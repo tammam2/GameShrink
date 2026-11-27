@@ -3,13 +3,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionMode {
-    /// Strongest playable mode: Intra-game hardlink dedup + NTFS LZX (game runs directly from .exe)
+    /// Playable Max: Strongest Windows compression (LZX) + skips already-compressed files. Runs directly from .exe.
     MaxCrush,
-    /// Forces NTFS LZX on every eligible file regardless of entropy + Intra-game hardlinks
+    /// Playable Extreme: Forces strongest Windows compression (LZX) on every file. Runs directly from .exe.
     BruteMax,
-    /// Zero-FPS adaptive: LZX on cold/load-once assets + XPRESS8K on streaming archives
+    /// Playable Balanced: Fast load times for open-world games (LZX on static + XPRESS8K on streaming).
     AdaptiveThermal,
-    /// Beyond-SOTA Deep Freeze: Stacks Intra-game Dedup + ChronoDelta LSH Residuals + CanonPack BCn + Auto-SIMD Bytecode + Zstd-19
+    /// Deep Freeze: Smallest possible size for games you aren't playing right now. 1-click Unpack to Play.
     HyperArchive,
 }
 
@@ -119,24 +119,21 @@ pub struct ScanPreview {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkSampleRow {
-    pub rel_path: String,
-    pub raw_bytes: u64,
-    pub zstd19_bytes: u64,
-    pub hyper_bytes: u64,
-    pub winning_codec: String,
-    pub extra_gain_pct: f64,
+pub struct ModeEstimate {
+    pub mode: String,
+    pub label: String,
+    pub playable_directly: bool,
+    pub estimated_after_bytes: u64,
+    pub estimated_saved_bytes: u64,
+    pub estimated_saved_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
     pub sample_count: u64,
-    pub total_raw_bytes: u64,
-    pub total_zstd19_bytes: u64,
-    pub total_hyper_bytes: u64,
-    pub chrono_delta_pairs_found: u64,
-    pub extra_saved_over_zstd_bytes: u64,
-    pub rows: Vec<BenchmarkSampleRow>,
+    pub total_game_bytes: u64,
+    pub duplicate_saved_bytes: u64,
+    pub estimates: Vec<ModeEstimate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
