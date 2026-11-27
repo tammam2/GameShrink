@@ -29,8 +29,9 @@ jobs:
       - name: Build gs_shim proxy launcher
         shell: pwsh
         run: |
-          cargo build --release --bin gs_shim --manifest-path src-tauri/Cargo.toml
           New-Item -ItemType Directory -Force -Path src-tauri/resources
+          New-Item -ItemType File -Force -Path src-tauri/resources/gs_shim.exe
+          cargo build --release --bin gs_shim --manifest-path src-tauri/Cargo.toml
           Copy-Item src-tauri/target/release/gs_shim.exe src-tauri/resources/gs_shim.exe -Force
 
       - name: Build Tauri NSIS & MSI installers
