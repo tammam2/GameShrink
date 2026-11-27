@@ -73,48 +73,7 @@ pub fn replace_with_hardlink(duplicate_path: &Path, canonical_path: &Path) -> Re
     }
 }
 
-fn create_hardlink_native(new_link: &Path, existing_target: &Path) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
-
-        let new_wide: Vec<u16> = new_link
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let target_wide: Vec<u16> = existing_target
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let ok = unsafe {
-            CreateHardLinkW(
-                new_wide.as_ptr(),
-                target_wide.as_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(anyhow!(
-                "CreateHardLinkW failed for {} -> {}",
-                new_link.display(),
-                existing_target.display()
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::fs::hard_link(existing_target, new_link)?;
-        Ok(())
-    }
-}
-
-/// Breaks an NTFS hardlink by cloning the file data to a fresh independent inode.
+fn create_hardlink_native(new_link: &Path, existing_target: &Path) -> Result<()> { std::fs::hard_link(existing_target, new_link)?; Ok(()) }`r`n`r`n/// Breaks an NTFS hardlink by cloning the file data to a fresh independent inode.
 pub fn break_hardlink(path: &Path) -> Result<()> {
     let tmp = path.with_extension("aethercrush_unhl_tmp");
     std::fs::copy(path, &tmp)?;
